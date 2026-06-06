@@ -1,0 +1,109 @@
+#include <windows.h>
+#include "resource.h"
+
+// v0.3.0 layout iteration:
+//   - "Output directory:" moved from a standalone full-width row at the
+//     top into the Output handling group (since picking *where* the run
+//     writes is conceptually part of "what we do with the output"). New
+//     order inside the group: Output directory → Add to case → Open
+//     folder.
+//   - All controls below the deleted standalone row shift up by 28 DLU
+//     (BE binary, Scanners group, Reset/Toggle, Output handling group,
+//     Threads/Max recursion). Output handling group grew from h=44 to
+//     h=72 to accommodate the new label + edit + browse row.
+//   - Threads/Max recursion are now parallel with the *checkboxes* at the
+//     bottom of Output handling rather than the path edit at the top —
+//     keeps the right-column controls visually grouped with action items.
+//   - The cpp's kShiftIds was extended to include the moved output-dir
+//     controls so the auto-fit shrink/shift logic still works correctly.
+//
+// v0.2.18 layout iteration (kept for archaeology):
+//   - Threads + Max recursion moved from a full-width row at the bottom to
+//     a vertically-stacked pair on the RIGHT of the Output handling group
+//     (parallel to it, like Reset/Toggle next to Scanners).
+//   - Scanners group title trimmed from "Scanners (default = bulk_extractor's
+//     defaults; check to enable, uncheck to disable)" to just "Scanners".
+//   - GROUPBOX titles are programmatically given a bold + slightly larger
+//     (11pt) font in WM_INITDIALOG for visual emphasis. Done in C++ rather
+//     than .rc since RC dialog templates carry only one font directive.
+//
+// v0.2.7+: dialog font 10pt for non-scanner controls; scanner checkboxes
+// programmatically created with their own 9pt font for density.
+IDD_SETTINGS DIALOGEX 0, 0, 400, 468
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "bulk_extractor - Settings"
+FONT 10, "MS Shell Dlg"
+BEGIN
+    // -------- Input source group (with tagging sub-options nested) --------
+    GROUPBOX        "Input source",                                     IDC_GROUP_INPUT,            7,   7, 386, 117
+    AUTORADIOBUTTON "&Active evidence object's source image",           IDC_RADIO_INPUT_EVOIMAGE,  14,  19, 180,  10, WS_GROUP | WS_TABSTOP
+    LTEXT           "",                                                 IDC_STATIC_EO_HINT,       196,  19, 190,  10
+    AUTORADIOBUTTON "&External file or directory (exported data or data not in the case):",
+                                                                        IDC_RADIO_INPUT_PICK,      14,  32, 372,  10
+    EDITTEXT                                                            IDC_EDIT_INPUT_PATH,       24,  44, 265,  12, ES_AUTOHSCROLL
+    PUSHBUTTON      "File...",                                          IDC_BTN_BROWSE_INPUT_FILE,292,  43,  47,  14
+    PUSHBUTTON      "Folder...",                                        IDC_BTN_BROWSE_INPUT_DIR, 342,  43,  47,  14
+    AUTORADIOBUTTON "Use &selected items in directory browser",         IDC_RADIO_INPUT_SELECTED,  14,  61, 180,  10
+    LTEXT           "",                                                 IDC_STATIC_SELECTED_COUNT,196,  61, 190,  10
+
+    // Tag sub-options — only meaningful with "Use selected items..." radio.
+    // Indented to align with the path-edit indent under the External radio.
+    AUTOCHECKBOX    "Tag scanned source items as ""bulk_extractor scanned""",
+                                                                        IDC_CHK_TAG_SCANNED,       24,  77, 360,  10
+    AUTOCHECKBOX    "Tag items with feature hits as ""bulk_extractor hits""",
+                                                                        IDC_CHK_TAG_HITS,          24,  91, 360,  10
+    AUTOCHECKBOX    "Also tag with per-scanner labels (e.g., ""bulk_extractor: net"", ""bulk_extractor: email"")",
+                                                                        IDC_CHK_TAG_HITS_PER_FEATURE, 34, 105, 350, 10
+
+    // -------- bulk_extractor binary --------
+    // v0.3.0: WSL toggle + detected-version readout share the label row.
+    // When IDC_CHK_USE_WSL is checked, IDC_EDIT_BE_BIN holds a Linux path
+    // (e.g., /usr/bin/bulk_extractor) instead of a Windows path. The
+    // checkbox is auto-disabled by C++ if WSL or BE-in-WSL is unavailable.
+    // y=130 (was 158) — shifted up after the standalone Output directory
+    // section moved into the Output handling group below.
+    LTEXT           "bulk_extractor binary:",                           IDC_LABEL_BE_BIN,           7, 130, 100,   8
+    AUTOCHECKBOX    "Run via WSL (use Linux bulk_extractor)",           IDC_CHK_USE_WSL,          110, 130, 160,  10
+    LTEXT           "",                                                 IDC_STATIC_WSL_VERSION,   275, 130, 114,   8
+    EDITTEXT                                                            IDC_EDIT_BE_BIN,            7, 140, 332,  12, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_BE,        342, 139,  47,  14
+    // v0.4.0: helper-identity verification status (blank unless rejected).
+    // Sits in the 12-DLU gap between the BE-binary edit and the Scanners group.
+    LTEXT           "",                                                 IDC_STATIC_BE_STATUS,       7, 154, 386,   9
+
+    // -------- Scanners group + Reset/Toggle to the RIGHT --------
+    // y=166 (was 194) — shifted up by 28 with the rest of the lower stack.
+    GROUPBOX        "Scanners",                                         IDC_GROUP_SCANNERS,         7, 166, 283, 196
+    // Buttons stacked vertically on the right at x=297, w=96.
+    PUSHBUTTON      "Reset to defaults",                                IDC_BTN_RESET_SCANNERS,   297, 178,  96,  16
+    PUSHBUTTON      "Check / Uncheck all",                              IDC_BTN_TOGGLE_ALL,       297, 198,  96,  16
+
+    // -------- Output handling group (LEFT) + Threads/MaxRecurse (RIGHT) --
+    // v0.3.0: group grew from h=44 to h=72 to host the output-directory
+    // row at the top. Order inside is: Output directory → Add to case →
+    // Open folder. Threads/Max recursion sit on the right, parallel with
+    // the two checkboxes (NOT the path edit) so the right-column controls
+    // visually align with the action items.
+    GROUPBOX        "Output handling",                                  IDC_GROUP_OUTPUT,           7, 370, 283,  72
+    LTEXT           "Output directory:",                                IDC_LABEL_OUTPUT,          14, 384,  80,   8
+    EDITTEXT                                                            IDC_EDIT_OUTPUT_DIR,       14, 394, 215,  12, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_OUTPUT,    233, 393,  47,  14
+    AUTOCHECKBOX    "Add output directory to X-Ways case as evidence object (Directory)",
+                                                                        IDC_CHK_ADD_TO_CASE,       14, 414, 263,  10
+    AUTOCHECKBOX    "Open output folder in Explorer when done",         IDC_CHK_OPEN_FOLDER,       14, 428, 263,  10
+
+    // Threads stacked over Max recursion on the right, parallel with the
+    // two checkboxes inside Output handling.
+    LTEXT           "Threads:",                                         IDC_LABEL_THREADS,        297, 414,  50,   8
+    COMBOBOX                                                            IDC_COMBO_THREADS,        350, 412,  43, 200, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Max recursion:",                                   IDC_LABEL_MAXRECURSE,     297, 428,  55,   8
+    EDITTEXT                                                            IDC_EDIT_MAXRECURSE,      355, 426,  38,  12, ES_AUTOHSCROLL | ES_NUMBER
+
+    // -------- Run / Cancel --------
+    // v0.4.0: both owner-draw so the Ctrl-to-save gesture can tint Run blue
+    // ("Save") and swap Cancel's label to "Save as...". DM_SETDEFID (set in
+    // WM_INITDIALOG) keeps Enter triggering Run without DEFPUSHBUTTON, which
+    // conflicts with BS_OWNERDRAW.
+    PUSHBUTTON      "Run",                                              IDOK,                     283, 448,  50,  14, BS_OWNERDRAW
+    PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 448,  50,  14, BS_OWNERDRAW
+END

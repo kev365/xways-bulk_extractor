@@ -1,0 +1,70 @@
+# bulk_extractor.cfg
+# =============================================================================
+# Source-tree reference cfg for the xways-bulk_extractor X-Tension. Deployed
+# alongside the DLL by build.bat as `bulk_extractor.cfg.example`.
+#
+# The X-Tension reads a LIVE file named `bulk_extractor.cfg` next to its DLL.
+# It is NOT auto-created from this example -- copy this file to
+# `bulk_extractor.cfg` (drop the `.example`) and edit, OR just use the
+# dialog's Ctrl+Run gesture, which writes `bulk_extractor.cfg` for you with
+# the current dialog state.
+#
+# All keys are optional. The X-Tension's compiled default is shown after the
+# `=` where one applies. Comment lines start with `#` or `;`. Values are
+# trimmed of surrounding whitespace. Edits take effect on the next dialog open.
+# =============================================================================
+
+
+# ----- Native Windows bulk_extractor binary ---------------------------------
+# Absolute path to bulk_extractor64.exe. Empty (default) = the X-Tension looks
+# in <dll-dir>\bulk_extractor64.exe (alongside the DLL).
+#
+# The resolved native binary is identity-verified before it is ever launched:
+# its PE VERSIONINFO (InternalName / OriginalFilename / ProductName /
+# FileDescription) OR its `--version` banner must contain "bulk_extractor".
+# A renamed / rogue exe at the expected path is rejected (the dialog shows a
+# flashing red "Not a valid bulk_extractor.exe file"; headless runs log the
+# rejection and bail). Grab a Windows release from:
+#   https://github.com/simsong/bulk_extractor/releases
+# be_binary=
+
+
+# ----- WSL bulk_extractor (Linux) -------------------------------------------
+# Run bulk_extractor via WSL instead of the native Windows binary (useful
+# because BE 2.1.x installs cleanly on Linux but doesn't build on Windows).
+#
+# wsl_be_binary : Linux-side path, e.g. /usr/bin/bulk_extractor. Empty =
+#                 auto-detected via `wsl -e which bulk_extractor`.
+# use_wsl       : pre-check the "Run via WSL" box on dialog open. Only honored
+#                 when WSL + bulk_extractor are actually detected. Truthy
+#                 values: true / yes / 1 / on (default false).
+#
+# Note: WSL binaries are NOT identity-verified (they live in the Linux
+# filesystem and can't be inspected from the Windows side).
+# wsl_be_binary=
+# use_wsl=false
+
+
+# ----- Selected-items temp dir ----------------------------------------------
+# In "Use selected items" mode the X-Tension exports each selected item to a
+# temp dir as xwitem_<itemID>_<leaf>.bin, runs BE on that dir, then maps hits
+# back to item IDs. keep_temp_dir controls cleanup:
+#   false (default) -- delete the temp dir on a successful run (the exported
+#                      .bin copies are full byte-for-byte copies of evidence
+#                      content; auto-cleanup keeps them from accumulating).
+#   true            -- keep the temp dir regardless, for post-run inspection.
+# Truthy values: true / yes / 1 / on. (On a FAILED run the dir is always kept
+# so you can inspect what was sent to BE.)
+# keep_temp_dir=false
+
+
+# ----- Output directory (NOT persisted by Ctrl+Run) -------------------------
+# Per the project output-dir convention, each run's output auto-resolves to a
+# fresh timestamped subdir:
+#   <case dir>\xways-bulk_extractor\bulk_extractor_<YYYYMMDD_HHMMSS>\
+# (case dir from XWF_GetCaseProp prop 6; falls back to %TEMP% with no case).
+# bulk_extractor refuses to reuse a non-empty output dir, so a per-run subdir
+# is required -- that's why this key is intentionally left out of the cfg
+# written by Ctrl+Run. Set it here ONLY if you want to force a fixed base for
+# every run (uncomment + edit).
+# default_output_dir=
