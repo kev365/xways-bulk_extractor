@@ -2830,260 +2830,12 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
         return;
     }
 
-    // --- Resolve inputPath based on mode --------------------------------
-    std::wstring inputForBE;
-    std::unordered_map<LONG, std::wstring> itemIdToTempName;  // populated only for SelectedItems
-    std::wstring tempInputDir;  // populated only for SelectedItems
-
-    switch (s.inputMode) {
-    case InputMode::ActiveEoImage: {
-        if (activeSrc.empty()) {
-            MessageBoxW(parent,
-                L"This evidence object does not expose a source path "
-                L"(common for physical-disk EOs). Use 'Pick file or directory' instead.",
-                L"bulk_extractor", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        inputForBE = activeSrc;
-        break;
-    }
-    case InputMode::PickPath: {
-        std::wstring p = TrimW(s.inputPath);
-        if (p.empty() || (!FileExists(p) && !DirExists(p))) {
-            MessageBoxW(parent, L"Input path does not exist.",
-                        L"bulk_extractor", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        inputForBE = p;
-        break;
-    }
-    case InputMode::SelectedItems: {
-        if (ctx.selected.empty()) {
-            MessageBoxW(parent, L"No items were selected.",
-                        L"bulk_extractor", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        Log(L"exporting selected items to temp dir...");
-        ExportResult er = ExportSelectedItems(ctx.hVolume, ctx.hEvidence, ctx.selected, s.tagScanned);
-        if (er.tempDir.empty() || er.exported == 0) {
-            MessageBoxW(parent, L"Failed to export selected items to temp dir.",
-                        L"bulk_extractor", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        wchar_t buf[160];
-        swprintf_s(buf, L"exported %d item(s) to %s",
-                   er.exported, er.tempDir.c_str());
-        Log(buf);
-        if (er.exportFailed > 0) {
-            swprintf_s(buf, L"  (%d failed to export)", er.exportFailed);
-            Log(buf);
-        }
-        if (er.virtualSkipped > 0) {
-            swprintf_s(buf, L"  (%d virtual / unreadable item(s) skipped)",
-                       er.virtualSkipped);
-            Log(buf);
-        }
-        if (s.tagScanned && er.taggedScanned > 0) {
-            swprintf_s(buf, L"  tagged %d item(s) as \"%s\"",
-                       er.taggedScanned, REPORT_TABLE_SCANNED);
-            Log(buf);
-            ctx.didMutate = true;
-        }
-        tempInputDir = er.tempDir;
-        inputForBE   = er.tempDir;
-        break;
-    }
-    }
-
-    // --- Validate BE binary --------------------------------------------
-    // WSL mode: the binary lives in the Linux filesystem, not on Windows
-    // side, so FileExists() can't help. Just require the field is non-empty.
-    // The actual existence check is done by WSL itself when CreateProcess
-    // launches `wsl.exe -e <path>` — failure there yields a non-zero exit
-    // code which we surface via the existing run-error path.
-    bool beValid;
-    if (s.useWsl) {
-        beValid = !TrimW(s.wslBeBinary).empty();
-    } else {
-        beValid = !TrimW(s.beBinary).empty() && FileExists(s.beBinary);
-    }
-    if (!beValid) {
-        MessageBoxW(parent,
-            s.useWsl ?
-            L"WSL bulk_extractor path is empty.\n\n"
-            L"Set 'wsl_be_binary=/path/...' in bulk_extractor.cfg, "
-            L"or pick / type the path manually in the dialog (e.g., "
-            L"/usr/bin/bulk_extractor)." :
-            L"bulk_extractor binary path is empty or does not point to a real file.\n\n"
-            L"Drop bulk_extractor64.exe next to the DLL, "
-            L"or set 'be_binary=...' in bulk_extractor.cfg, "
-            L"or pick the path manually in the dialog.",
-            L"bulk_extractor", MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    // v0.4.0: final identity gate before spawn (native mode only — the WSL
-    // binary can't be inspected from Windows). The dialog already rejects a
-    // bad native pick inline, but a cfg/bundled path that fails verification
-    // (or a binary swapped after the dialog opened) is caught here. Reject
-    // hard — log the reason verbatim and bail rather than launch some other
-    // exe with the bulk_extractor CLI shape.
-    if (!s.useWsl) {
-        std::wstring idDetail;
-        if (!VerifyHelperIdentity(s.beBinary, kHelperIdentityNeedle, idDetail)) {
-            Log(L"REJECTED native bulk_extractor binary before run (" +
-                s.beBinary + L") — " + idDetail);
-            MessageBoxW(parent,
-                (L"The selected file does not identify itself as bulk_extractor:\n\n    " +
-                 s.beBinary + L"\n\n" + idDetail +
-                 L"\n\nPick a real bulk_extractor64.exe via Browse..., or correct "
-                 L"'be_binary=' in bulk_extractor.cfg.").c_str(),
-                L"bulk_extractor", MB_OK | MB_ICONWARNING);
-            return;
-        }
-        Log(L"bulk_extractor binary verified before run (" + s.beBinary + L") — " + idDetail);
-    }
-
-    // --- Make sure output dir exists ------------------------------------
-    if (!DirExists(s.outputDir)) {
-        // CreateDirectory does not auto-create intermediate dirs. Build them.
-        std::wstring p; p.reserve(s.outputDir.size());
-        for (size_t i = 0; i < s.outputDir.size(); ++i) {
-            p.push_back(s.outputDir[i]);
-            if (s.outputDir[i] == L'\\' || i == s.outputDir.size() - 1) {
-                if (!p.empty() && !DirExists(p)) CreateDirectoryW(p.c_str(), nullptr);
-            }
-        }
-        if (!DirExists(s.outputDir)) {
-            MessageBoxW(parent, L"Failed to create output directory.",
-                        L"bulk_extractor", MB_OK | MB_ICONWARNING);
-            return;
-        }
-    }
-    // BE refuses to run if the output dir already contains BE artifacts. We
-    // honor that — analyst should pick an empty / new dir. Just log it.
-    Log(L"output dir: "    + s.outputDir);
-    Log(L"input for BE: "  + inputForBE);
-    if (s.useWsl) {
-        Log(L"running via WSL: " + s.wslBeBinary);
-    }
-
-    // --- Run BE ---------------------------------------------------------
-    DWORD exitCode = 0;
-    std::wstring runErr;
-    bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr, /*pumpMessages=*/true);
-    {
-        wchar_t buf[160];
-        swprintf_s(buf, L"bulk_extractor exit code: %lu", (unsigned long)exitCode);
-        Log(buf);
-    }
-    if (!ok && !runErr.empty()) Log(L"error: " + runErr);
-
-    // --- Post-processing -----------------------------------------------
-    if (s.openFolder) OpenInExplorer(s.outputDir);
-
-    if (s.addToCase) {
-        if (AddOutputAsEvidence(s.outputDir)) {
-            ctx.didMutate = true;
-        } else {
-            Log(L"(could not add output as evidence object — see prior message)");
-        }
-    }
-
-    if (s.tagHits && s.inputMode == InputMode::SelectedItems) {
-        FeatureHits fh = CollectHitsByFeature(s.outputDir);
-        // 1) Always (when tagHits) apply the umbrella "bulk_extractor hits"
-        //    label to every item with at least one hit in any feature.
-        UINT64 tagged = 0;
-        if (XWF_Label || XWF_AddToReportTable) {
-            for (LONG id : fh.union_) {
-                if (XWF_Label ? XWF_Label(id, REPORT_TABLE_HITS,
-                                          REPORT_TABLE_FLAG_CREATED_BY_APP)
-                              : XWF_AddToReportTable(id, REPORT_TABLE_HITS,
-                                                     REPORT_TABLE_FLAG_CREATED_BY_APP)) {
-                    ++tagged;
-                }
-            }
-        }
-        if (tagged > 0) ctx.didMutate = true;
-        wchar_t buf[200];
-        swprintf_s(buf,
-            L"feature-file scan: %zu source item(s) had hits; tagged %llu with \"%s\"",
-            fh.union_.size(), (unsigned long long)tagged, REPORT_TABLE_HITS);
-        Log(buf);
-
-        // 2) v0.2.11 sub-option (refined v0.2.13): apply per-scanner labels
-        //    in addition to the umbrella label. Aggregate the per-feature
-        //    map into a per-scanner map via FeatureToScanner — `url.txt`,
-        //    `domain.txt`, `ip.txt` etc. all collapse to the `net` scanner
-        //    so the analyst sees Labels like "bulk_extractor: net" that
-        //    match the scanner names in the Scanners checklist.
-        if (s.tagHitsPerFeature && (XWF_Label || XWF_AddToReportTable) && !fh.byFeature.empty()) {
-            std::unordered_map<std::wstring, std::unordered_set<LONG>> byScanner;
-            for (const auto& kv : fh.byFeature) {
-                std::wstring scanner = FeatureToScanner(kv.first);
-                if (scanner.empty()) continue;  // skip unmapped/system entries
-                auto& dst = byScanner[scanner];
-                dst.insert(kv.second.begin(), kv.second.end());
-            }
-
-            std::vector<std::wstring> scanners;
-            scanners.reserve(byScanner.size());
-            for (const auto& kv : byScanner) scanners.push_back(kv.first);
-            std::sort(scanners.begin(), scanners.end());
-
-            UINT64 perScannerLabels = 0;
-            UINT64 perScannerApplications = 0;
-            for (const std::wstring& scanner : scanners) {
-                std::wstring label = L"bulk_extractor: " + scanner;
-                UINT64 thisCount = 0;
-                for (LONG id : byScanner[scanner]) {
-                    if (XWF_Label ? XWF_Label(id, label.c_str(),
-                                              REPORT_TABLE_FLAG_CREATED_BY_APP)
-                                  : XWF_AddToReportTable(id, label.c_str(),
-                                                         REPORT_TABLE_FLAG_CREATED_BY_APP)) {
-                        ++thisCount;
-                    }
-                }
-                if (thisCount > 0) {
-                    ++perScannerLabels;
-                    perScannerApplications += thisCount;
-                    swprintf_s(buf,
-                        L"  per-scanner: \"%s\" -> %llu item(s)",
-                        label.c_str(), (unsigned long long)thisCount);
-                    Log(buf);
-                }
-            }
-            swprintf_s(buf,
-                L"per-scanner tagging: %llu label(s) applied across %llu item(s)",
-                (unsigned long long)perScannerLabels,
-                (unsigned long long)perScannerApplications);
-            Log(buf);
-            if (perScannerApplications > 0) ctx.didMutate = true;
-        }
-    }
-
-    // v0.2.4: cleanup the selected-items export temp dir.
-    //   On BE-success and `keep_temp_dir=false` (default): delete recursively
-    //   so the exported xwitem_*.bin copies don't accumulate on disk across
-    //   runs (each is a full byte-copy of the source item — sensitive content
-    //   that doesn't belong outside the case).
-    //   On BE-failure: keep the dir so the analyst can inspect what was sent
-    //   to bulk_extractor.
-    //   On `keep_temp_dir=true`: keep regardless.
-    if (!tempInputDir.empty()) {
-        if (ok && !s.keepTempDir) {
-            if (DeleteDirRecursive(tempInputDir)) {
-                Log(L"selected-items temp dir cleaned up: " + tempInputDir);
-            } else {
-                Log(L"selected-items temp dir cleanup FAILED at: " + tempInputDir);
-            }
-        } else if (!ok) {
-            Log(L"selected-items temp dir KEPT (BE failed) at: " + tempInputDir);
-        } else {
-            Log(L"selected-items temp dir KEPT (keep_temp_dir=true) at: " + tempInputDir);
-        }
-    }
+    // Phase 1: run synchronously on the calling (UI) thread, pumpMessages=true,
+    // exactly as before the worker-thread refactor. Phase 2 moves this onto a
+    // worker thread started from the dialog's IDOK handler.
+    bool didMutate = false;
+    RunWorkerEntry(ctx, s, /*pumpMessages=*/true, &didMutate);
+    if (didMutate) ctx.didMutate = true;
 }
 
 // =============================================================================
@@ -3346,8 +3098,6 @@ static bool __stdcall BulkExtractorOnFinalize(HANDLE hVolume, HANDLE hEvidence,
 
     // ---- Build the run Settings from the harvested managed state.
     Settings s = g_managed_settings;
-    HANDLE hVol = hVolume   ? hVolume   : g_managed_collected.hVolume;
-    HANDLE hEv  = hEvidence ? hEvidence : g_managed_collected.hEvidence;
     s.selectionMode = g_managed_collected.selectionMode;
     s.selectedCount = (int)g_managed_collected.selected.size();
 
@@ -3355,19 +3105,25 @@ static bool __stdcall BulkExtractorOnFinalize(HANDLE hVolume, HANDLE hEvidence,
     // selection, force selected-items mode (matches XT_Prepare's DBC branch).
     if (g_managed_collected.selectionMode) s.inputMode = InputMode::SelectedItems;
 
-    // ---- Resolve inputPath per mode (re-statement of RunFlow's switch; modal
-    //      MessageBox -> Log()).
-    std::wstring inputForBE;
-    std::wstring tempInputDir;
-    bool didMutate = false;
+    // Build the RunCtx for the shared body. Preserve the param-wins-over-
+    // collected precedence the managed path has always used (param handle wins
+    // when X-Ways supplies one at Finalize; else fall back to what OnPrepare
+    // stashed). Mirror it for BOTH hVolume and hEvidence.
+    RunCtx mctx;
+    mctx.hVolume       = hVolume   ? hVolume   : g_managed_collected.hVolume;
+    mctx.hEvidence     = hEvidence ? hEvidence : g_managed_collected.hEvidence;
+    mctx.selectionMode = g_managed_collected.selectionMode;
+    mctx.selected      = g_managed_collected.selected;
 
-    switch (s.inputMode) {
-    case InputMode::ActiveEoImage: {
-        // Resolve the active EO's source path now (volume-dependent — can't be
-        // primed at OnInit). Same two-stage probe RunFlow uses, condensed.
+    // ActiveEoImage: resolve the active EO's on-disk source path now (volume-
+    // dependent — can't be primed at OnInit) and stash into s.inputPath so the
+    // shared body resolves it identically to the standalone path. Same two-stage
+    // probe RunFlow uses, condensed (single-stage here, matching the prior
+    // managed code). If unresolvable, bail with a Log() (no modal in managed).
+    if (s.inputMode == InputMode::ActiveEoImage) {
         std::wstring activeSrc;
-        if (XWF_GetProp && hVol) {
-            INT64 rv8 = XWF_GetProp(hVol, 8, nullptr);
+        if (XWF_GetProp && mctx.hVolume) {
+            INT64 rv8 = XWF_GetProp(mctx.hVolume, 8, nullptr);
             wchar_t snap[1024] = {0};
             if (SafeWcsCopyFromPtr(rv8, snap, 1024) > 0) {
                 std::wstring raw = TrimW(snap);
@@ -3388,155 +3144,17 @@ static bool __stdcall BulkExtractorOnFinalize(HANDLE hVolume, HANDLE hEvidence,
             g_managed_collected = ManagedCollected{};
             return false;
         }
-        inputForBE = activeSrc;
-        break;
-    }
-    case InputMode::PickPath: {
-        std::wstring p = TrimW(s.inputPath);
-        if (p.empty() || (!FileExists(p) && !DirExists(p))) {
-            Log(L"managed run: input path is empty or does not exist: " + p);
-            g_managed_collected = ManagedCollected{};
-            return false;
-        }
-        inputForBE = p;
-        break;
-    }
-    case InputMode::SelectedItems: {
-        if (!hVol) {
-            Log(L"managed run: selected-items mode needs a volume handle to read "
-                L"item bytes, but X-Ways did not provide one (Case Root window?).");
-            g_managed_collected = ManagedCollected{};
-            return false;
-        }
-        if (g_managed_collected.selected.empty()) {
-            Log(L"managed run: no items in scope (nothing selected).");
-            g_managed_collected = ManagedCollected{};
-            return true;
-        }
-        Log(L"managed run: exporting selected items to temp dir...");
-        ExportResult er = ExportSelectedItems(hVol, hEv,
-                                              g_managed_collected.selected, s.tagScanned);
-        if (er.tempDir.empty() || er.exported == 0) {
-            Log(L"managed run: failed to export selected items to temp dir.");
-            g_managed_collected = ManagedCollected{};
-            return false;
-        }
-        Log(FormatStr(L"exported %d item(s) to %s", er.exported, er.tempDir.c_str()));
-        if (s.tagScanned && er.taggedScanned > 0) {
-            Log(FormatStr(L"  tagged %d item(s) as \"%s\"",
-                          er.taggedScanned, REPORT_TABLE_SCANNED));
-            didMutate = true;
-        }
-        tempInputDir = er.tempDir;
-        inputForBE   = er.tempDir;
-        break;
-    }
+        s.inputPath = activeSrc;
     }
 
-    // ---- Validate + identity-gate the BE binary (re-statement of RunFlow).
-    bool beValid = s.useWsl ? !TrimW(s.wslBeBinary).empty()
-                            : (!TrimW(s.beBinary).empty() && FileExists(s.beBinary));
-    if (!beValid) {
-        Log(L"managed run: bulk_extractor binary path is empty or missing. Set "
-            L"'be_binary='/'wsl_be_binary=' in bulk_extractor.cfg or the tab.");
-        g_managed_collected = ManagedCollected{};
-        return false;
-    }
-    if (!s.useWsl) {
-        std::wstring idDetail;
-        if (!VerifyHelperIdentity(s.beBinary, kHelperIdentityNeedle, idDetail)) {
-            Log(L"REJECTED native bulk_extractor binary before run (" + s.beBinary +
-                L") — " + idDetail);
-            g_managed_collected = ManagedCollected{};
-            return false;
-        }
-        Log(L"bulk_extractor binary verified before run (" + s.beBinary + L") — " + idDetail);
-    }
-
-    // ---- Ensure output dir exists (mirror RunFlow's incremental mkdir).
-    if (!DirExists(s.outputDir)) {
-        std::wstring p; p.reserve(s.outputDir.size());
-        for (size_t i = 0; i < s.outputDir.size(); ++i) {
-            p.push_back(s.outputDir[i]);
-            if (s.outputDir[i] == L'\\' || i == s.outputDir.size() - 1) {
-                if (!p.empty() && !DirExists(p)) CreateDirectoryW(p.c_str(), nullptr);
-            }
-        }
-        if (!DirExists(s.outputDir)) {
-            Log(L"managed run: failed to create output directory: " + s.outputDir);
-            g_managed_collected = ManagedCollected{};
-            return false;
-        }
-    }
-    Log(L"output dir: "   + s.outputDir);
-    Log(L"input for BE: " + inputForBE);
-    if (s.useWsl) Log(L"running via WSL: " + s.wslBeBinary);
-
-    // ---- Run BE synchronously (same leaf helper the standalone path uses).
-    DWORD exitCode = 0;
-    std::wstring runErr;
-    bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr, /*pumpMessages=*/true);
-    Log(FormatStr(L"bulk_extractor exit code: %lu", (unsigned long)exitCode));
-    if (!ok && !runErr.empty()) Log(L"error: " + runErr);
-
-    // ---- Post-processing (mirror RunFlow; openFolder honored as standalone).
-    if (s.openFolder) OpenInExplorer(s.outputDir);
-    if (s.addToCase) {
-        if (AddOutputAsEvidence(s.outputDir)) didMutate = true;
-        else Log(L"(could not add output as evidence object — see prior message)");
-    }
-    if (s.tagHits && s.inputMode == InputMode::SelectedItems) {
-        FeatureHits fh = CollectHitsByFeature(s.outputDir);
-        UINT64 tagged = 0;
-        if (XWF_Label || XWF_AddToReportTable) {
-            for (LONG id : fh.union_) {
-                if (XWF_Label ? XWF_Label(id, REPORT_TABLE_HITS, REPORT_TABLE_FLAG_CREATED_BY_APP)
-                              : XWF_AddToReportTable(id, REPORT_TABLE_HITS, REPORT_TABLE_FLAG_CREATED_BY_APP))
-                    ++tagged;
-            }
-        }
-        if (tagged > 0) didMutate = true;
-        Log(FormatStr(L"feature-file scan: %zu source item(s) had hits; tagged %llu with \"%s\"",
-                      fh.union_.size(), (unsigned long long)tagged, REPORT_TABLE_HITS));
-
-        if (s.tagHitsPerFeature && (XWF_Label || XWF_AddToReportTable) && !fh.byFeature.empty()) {
-            std::unordered_map<std::wstring, std::unordered_set<LONG>> byScanner;
-            for (const auto& kv : fh.byFeature) {
-                std::wstring scanner = FeatureToScanner(kv.first);
-                if (scanner.empty()) continue;
-                auto& dst = byScanner[scanner];
-                dst.insert(kv.second.begin(), kv.second.end());
-            }
-            for (const auto& kv : byScanner) {
-                std::wstring label = L"bulk_extractor: " + kv.first;
-                UINT64 thisCount = 0;
-                for (LONG id : kv.second) {
-                    if (XWF_Label ? XWF_Label(id, label.c_str(), REPORT_TABLE_FLAG_CREATED_BY_APP)
-                                  : XWF_AddToReportTable(id, label.c_str(), REPORT_TABLE_FLAG_CREATED_BY_APP))
-                        ++thisCount;
-                }
-                if (thisCount > 0) {
-                    didMutate = true;
-                    Log(FormatStr(L"  per-scanner: \"%s\" -> %llu item(s)",
-                                  label.c_str(), (unsigned long long)thisCount));
-                }
-            }
-        }
-    }
-
-    // ---- Cleanup the selected-items export temp dir (mirror RunFlow).
-    if (!tempInputDir.empty()) {
-        if (ok && !s.keepTempDir) {
-            DeleteDirRecursive(tempInputDir);
-            Log(L"selected-items temp dir cleaned up: " + tempInputDir);
-        } else if (!ok) {
-            Log(L"selected-items temp dir KEPT (BE failed) at: " + tempInputDir);
-        } else {
-            Log(L"selected-items temp dir KEPT (keep_temp_dir=true) at: " + tempInputDir);
-        }
-    }
-
+    // Managed/headless run shares the single RunWorkerEntry body (synchronous,
+    // no thread, pumpMessages=true — the manager owns the UI thread and forbids
+    // nested modals; no in-DLL Cancel here per design §3.4). g_dlgHwnd is null
+    // on this path so PostWorkerStatus/PostWorkerDone (added Phase 2) no-op.
+    bool didMutate = false;
+    RunWorkerEntry(mctx, s, /*pumpMessages=*/true, &didMutate);
     (void)didMutate;  // managed mode: snapshot-save persistence is the manager's call.
+
     g_managed_collected = ManagedCollected{};
     return true;
 }
