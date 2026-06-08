@@ -2464,6 +2464,8 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         if (p.empty()) {
             Log(L"This evidence object does not expose a source path "
                 L"(common for physical-disk EOs). Use 'Pick file or directory' instead.");
+            PostWorkerStatus(L"Failed: evidence object has no source path.");
+            PostWorkerDone(2);
             return false;
         }
         inputForBE = p;
@@ -2473,6 +2475,8 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         std::wstring p = TrimW(s.inputPath);
         if (p.empty() || (!FileExists(p) && !DirExists(p))) {
             Log(L"Input path does not exist.");
+            PostWorkerStatus(L"Failed: input path does not exist.");
+            PostWorkerDone(2);
             return false;
         }
         inputForBE = p;
@@ -2481,12 +2485,17 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
     case InputMode::SelectedItems: {
         if (ctx.selected.empty()) {
             Log(L"No items were selected.");
+            PostWorkerStatus(L"Failed: no items selected.");
+            PostWorkerDone(2);
             return false;
         }
         Log(L"exporting selected items to temp dir...");
+        PostWorkerStatus(L"Exporting selected items…");
         ExportResult er = ExportSelectedItems(ctx.hVolume, ctx.hEvidence, ctx.selected, s.tagScanned);
         if (er.tempDir.empty() || er.exported == 0) {
             Log(L"Failed to export selected items to temp dir.");
+            PostWorkerStatus(L"Failed: could not export selected items.");
+            PostWorkerDone(2);
             return false;
         }
         wchar_t buf[160];
@@ -2526,6 +2535,8 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
     if (!beValid) {
         Log(L"bulk_extractor binary path is empty or does not point to a real file "
             L"— set it in the dialog / cfg.");
+        PostWorkerStatus(L"Failed: bulk_extractor binary not found.");
+        PostWorkerDone(2);
         return false;
     }
 
@@ -2537,6 +2548,8 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         if (!VerifyHelperIdentity(s.beBinary, kHelperIdentityNeedle, idDetail)) {
             Log(L"REJECTED native bulk_extractor binary before run (" +
                 s.beBinary + L") — " + idDetail);
+            PostWorkerStatus(L"Failed: not a valid bulk_extractor binary.");
+            PostWorkerDone(2);
             return false;
         }
         Log(L"bulk_extractor binary verified before run (" + s.beBinary + L") — " + idDetail);
@@ -2557,6 +2570,8 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
             if (!tempInputDir.empty()) {
                 Log(L"selected-items temp dir KEPT (output dir failed) at: " + tempInputDir);
             }
+            PostWorkerStatus(L"Failed: could not create output directory.");
+            PostWorkerDone(2);
             return false;
         }
     }
@@ -2571,6 +2586,7 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
     // --- Run BE ---------------------------------------------------------
     DWORD exitCode = 0;
     std::wstring runErr;
+    PostWorkerStatus(L"Running bulk_extractor… (see console window)");
     bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr, pumpMessages);
     {
         wchar_t buf[160];
@@ -2675,6 +2691,23 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         } else {
             Log(L"selected-items temp dir KEPT (keep_temp_dir=true) at: " + tempInputDir);
         }
+    }
+
+    // --- Completion epilogue: post exactly one DONE so the dialog returns to
+    //     idle. (g_cancelRequested gains real in-loop checks + TerminateProcess
+    //     in Phase 3; here it's only set if Cancel was clicked during the run.)
+    if (g_cancelRequested.load()) {
+        Log(L"Run cancelled by user.");
+        PostWorkerStatus(L"Cancelled.");
+        PostWorkerDone(1);
+        return false;
+    }
+    if (ok) {
+        PostWorkerStatus(L"Done. See Messages window for the run summary.");
+        PostWorkerDone(0);
+    } else {
+        PostWorkerStatus(L"Failed: bulk_extractor returned a nonzero exit code (see Messages).");
+        PostWorkerDone(2);
     }
     return ok;
 }
