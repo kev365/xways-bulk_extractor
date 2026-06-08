@@ -49,6 +49,7 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cwctype>
@@ -219,6 +220,26 @@ static pfn_XWF_CloseEvObj       XWF_CloseEvObj       = nullptr;
 // relative to the DLL (sidecar cfg + bundled BE binary).
 static HMODULE g_hSelf     = nullptr;
 static HWND    g_hMainWnd  = nullptr;
+
+// --- In-DLL Cancel / worker-thread state (v0.5.0) --------------------------
+//   Mirrors xways-ual-timeliner. The settings dialog hosts the run on a
+//   detached std::thread; these atomics bridge the X-Ways UI thread and the
+//   worker. g_dlgHwnd is the PostMessage target (null on the synchronous
+//   managed/headless path -> the Post helpers no-op). g_workerActive blocks
+//   WM_CLOSE while running and gates the Ctrl-to-save poll. g_cancelRequested
+//   is the cooperative-abort flag. g_beChildProcess publishes the in-flight BE
+//   child HANDLE so Cancel can TerminateProcess it from the UI thread.
+//   g_workerDidMutate is the worker's mutate sink (threaded back to
+//   g_run.didMutate in WM_APP_DONE). kElapsedTimerId drives the 1 s
+//   "Running... mm:ss" status clock (distinct from kCtrlPollTimerId 0xBE10 /
+//   kHelperFlashTimerId 0xBE12).
+static constexpr UINT_PTR  kElapsedTimerId = 0xBE14;
+static std::atomic<bool>   g_workerActive{false};
+static std::atomic<bool>   g_cancelRequested{false};
+static std::atomic<bool>   g_workerDidMutate{false};
+static std::atomic<HANDLE> g_beChildProcess{nullptr};
+static HWND                g_dlgHwnd = nullptr;
+static ULONGLONG           g_runStartTick = 0;
 
 // SEH-protected wide-string copy from a foreign pointer. Pure POD locals so
 // MSVC doesn't reject __try with C2712 (no C++ object unwinding required).
@@ -2842,6 +2863,13 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
 //  Entry points
 // =============================================================================
 static RunCtx g_run;
+
+// Worker-owned copies of the run inputs. The dialog's Settings* points at
+// ShowSettingsDialog's stack &s; the detached worker outlives that scope, so
+// IDOK copies the resolved settings + run context here before spawning the
+// thread.
+static RunCtx   g_workerCtx;
+static Settings g_workerSettings;
 
 extern "C" {
 
