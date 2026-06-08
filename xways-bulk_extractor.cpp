@@ -1076,6 +1076,35 @@ static CfgValues CollectCfgFromDialog(HWND hDlg, const Settings* s) {
     return cfg;
 }
 
+// --- Run context --------------------------------------------------------------
+//   Carries the handles + selected-item list from XT_Prepare/XT_ProcessItem
+//   through RunFlow into the worker. Defined here (ahead of SettingsDlgProc)
+//   because the v0.5.0 dialog handlers reference g_run / g_workerCtx in the
+//   IDOK and WM_APP_DONE paths, so the type + globals must be in scope before
+//   the dialog proc.
+struct RunCtx {
+    HANDLE hVolume   = nullptr;
+    HANDLE hEvidence = nullptr;
+    bool   selectionMode    = false;
+    std::vector<LONG> selected;  // populated by XT_ProcessItem under DBC
+
+    // v0.2.3: track whether the run mutated snapshot state (added Labels,
+    // created an evidence object). XT_Finalize returns 0x02 if so to ask
+    // X-Ways to persist the volume snapshot — saves the analyst a manual
+    // save step. Per 21.3 Preview 3 forum announcement; see
+    // docs/xtension-invocation.md "Return values".
+    bool didMutate = false;
+};
+
+static RunCtx g_run;
+
+// Worker-owned copies of the run inputs. The dialog's Settings* points at
+// ShowSettingsDialog's stack &s; the detached worker outlives that scope, so
+// IDOK copies the resolved settings + run context here before spawning the
+// thread.
+static RunCtx   g_workerCtx;
+static Settings g_workerSettings;
+
 // Enable/disable controls based on the selected input radio.
 static void UpdateInputState(HWND hDlg, const Settings* s) {
     bool isPick     = IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_PICK)     == BST_CHECKED;
@@ -1104,6 +1133,26 @@ static void UpdateInputState(HWND hDlg, const Settings* s) {
         EnableWindow(GetDlgItem(hDlg, IDC_RADIO_INPUT_SELECTED), s->selectionMode    ? TRUE : FALSE);
     }
 }
+
+// Settings controls disabled while a run is in flight, re-enabled by the
+// WM_APP_DONE handler. Centralized so StartBeWorker and WM_APP_DONE stay in
+// sync (mirrors ual-timeliner's kRunLockIds). Scanner checkboxes (IDC_SCANNER_BASE
+// .. IDC_SCANNER_BASE+kNumScanners) are disabled separately via a loop (there
+// are up to kNumScanners of them, created programmatically).
+static const int kRunLockIds[] = {
+    IDC_RADIO_INPUT_EVOIMAGE, IDC_RADIO_INPUT_PICK, IDC_RADIO_INPUT_SELECTED,
+    IDC_EDIT_INPUT_PATH, IDC_BTN_BROWSE_INPUT_FILE, IDC_BTN_BROWSE_INPUT_DIR,
+    IDC_EDIT_OUTPUT_DIR, IDC_BTN_BROWSE_OUTPUT,
+    IDC_EDIT_BE_BIN, IDC_BTN_BROWSE_BE, IDC_CHK_USE_WSL,
+    IDC_COMBO_THREADS, IDC_EDIT_MAXRECURSE,
+    IDC_BTN_RESET_SCANNERS, IDC_BTN_TOGGLE_ALL,
+    IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
+    IDC_CHK_TAG_SCANNED, IDC_CHK_TAG_HITS, IDC_CHK_TAG_HITS_PER_FEATURE,
+};
+
+// Forward declaration — definition lives after RunWorkerEntry (which the
+// worker lambda inside StartBeWorker calls).
+static void StartBeWorker(HWND hDlg);
 
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     static Settings* s = nullptr;
@@ -1434,6 +1483,15 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         // can Browse... to a real bulk_extractor64.exe before Run.
         g_helperRejected   = false;
         g_helperFlashTicks = 0;
+
+        // v0.5.0: capture the dialog HWND (the worker's PostMessage target) and
+        // reset the run-state globals to idle so a re-opened dialog starts clean.
+        g_dlgHwnd = hDlg;
+        g_workerActive.store(false);
+        g_cancelRequested.store(false);
+        g_beChildProcess.store(nullptr);
+        g_runStartTick = 0;
+
         SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"");
         if (!s->useWsl && !TrimW(s->beBinary).empty() && FileExists(s->beBinary)) {
             std::wstring idDetail;
@@ -1479,6 +1537,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
     }
     case WM_TIMER: {
         if (wp == kCtrlPollTimerId) {
+            if (g_workerActive.load()) return TRUE;   // Ctrl-to-save inert during a run
             bool nowDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (nowDown != g_runCtrlDown) {
                 g_runCtrlDown = nowDown;
@@ -1506,6 +1565,16 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 if (g_helperFlashTicks == 0)
                     KillTimer(hDlg, kHelperFlashTimerId);
             }
+            return TRUE;
+        }
+        if (wp == kElapsedTimerId) {
+            if (!g_workerActive.load()) { KillTimer(hDlg, kElapsedTimerId); return TRUE; }
+            ULONGLONG elapsedMs = GetTickCount64() - g_runStartTick;
+            unsigned secs = (unsigned)(elapsedMs / 1000);
+            wchar_t buf[96];
+            swprintf_s(buf, L"Running bulk_extractor… %02u:%02u (see console window)",
+                       secs / 60, secs % 60);
+            SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, buf);
             return TRUE;
         }
         return FALSE;
@@ -1741,10 +1810,45 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 SetFocus(GetDlgItem(hDlg, IDC_EDIT_OUTPUT_DIR));
                 return TRUE;
             }
-            EndDialog(hDlg, IDOK);
+
+            // v0.5.0: final native identity gate inline, BEFORE starting the
+            // worker — so a bad binary surfaces via the in-dialog flash UI
+            // (IDC_STATIC_BE_STATUS, the IDC_BTN_BROWSE_BE Browse path) instead
+            // of only the worker's Log-only path. WSL mode is exempt (the Linux
+            // binary can't be PE-inspected from Windows); just require non-empty.
+            if (!s->useWsl) {
+                if (TrimW(s->beBinary).empty() || !FileExists(s->beBinary)) {
+                    ShowHelperRejection(hDlg, s->beBinary, L"file not found");
+                    return TRUE;
+                }
+                std::wstring idDetail;
+                if (!VerifyHelperIdentity(s->beBinary, kHelperIdentityNeedle, idDetail)) {
+                    ShowHelperRejection(hDlg, s->beBinary, idDetail);
+                    return TRUE;
+                }
+            } else if (TrimW(s->wslBeBinary).empty()) {
+                MessageBoxW(hDlg, L"WSL bulk_extractor path is required.",
+                            L"bulk_extractor", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+
+            // Copy resolved settings + run context into worker-owned storage
+            // (the modal Settings* points at ShowSettingsDialog's stack &s that
+            // the detached worker must not depend on). g_run holds
+            // hVolume/hEvidence/selected for the standalone path; mirror it.
+            g_workerSettings = *s;
+            g_workerCtx      = g_run;
+
+            StartBeWorker(hDlg);
             return TRUE;
         }
         case IDCANCEL: {
+            // v0.5.0 (Phase 2 safety): while a run is active, Cancel/Esc must NOT
+            // close the dialog out from under the detached worker thread. A real
+            // Cancel-as-abort (set g_cancelRequested + TerminateProcess) replaces
+            // this guard in the Cancel phase. For now, just swallow it.
+            if (g_workerActive.load()) return TRUE;
+
             // v0.4.0: Ctrl+Close = "Save as..." — pick a .cfg path and write
             // the current settings there, then close. The export is a copy;
             // the X-Tension only auto-loads the standard sidecar next to its
@@ -1776,7 +1880,47 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         (void)evt;
         return FALSE;
     }
+    case WM_APP_STATUS: {
+        wchar_t* text = (wchar_t*)lp;
+        if (text) {
+            SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, text);
+            delete[] text;
+        }
+        return TRUE;
+    }
+    case WM_APP_DONE: {
+        // wp: 0 ok, 1 cancelled, 2 failed.
+        g_workerActive.store(false);
+        KillTimer(hDlg, kElapsedTimerId);
+        g_beChildProcess.store(nullptr);
+
+        // Thread the worker's mutate flag back so XT_Finalize can return 0x02.
+        if (g_workerDidMutate.load()) g_run.didMutate = true;
+
+        // Re-enable Run + settings + the scanner checkboxes (inverse of
+        // StartBeWorker). IDCANCEL is re-enabled explicitly (it is not in
+        // kRunLockIds and Phase 3's IDCANCEL abort disables it mid-cancel).
+        EnableWindow(GetDlgItem(hDlg, IDOK), TRUE);
+        for (int id : kRunLockIds) {
+            HWND h = GetDlgItem(hDlg, id);
+            if (h) EnableWindow(h, TRUE);
+        }
+        for (int i = 0; i < kNumScanners; ++i) {
+            HWND h = GetDlgItem(hDlg, IDC_SCANNER_BASE + i);
+            if (h) EnableWindow(h, TRUE);
+        }
+        EnableWindow(GetDlgItem(hDlg, IDCANCEL), TRUE);
+
+        // Re-apply input-mode enable/disable logic (some controls are mode-gated).
+        if (s) UpdateInputState(hDlg, s);
+
+        // The worker already posted the final WM_APP_STATUS summary text; leave
+        // the status line as-is. Move focus to the (now close-acting) Cancel.
+        SetFocus(GetDlgItem(hDlg, IDCANCEL));
+        return TRUE;
+    }
     case WM_CLOSE:
+        if (g_workerActive.load()) return TRUE;   // must Cancel first
         EndDialog(hDlg, IDCANCEL);
         return TRUE;
     case WM_DESTROY:
@@ -1785,6 +1929,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         // cached (reused across opens), so it's left alive intentionally.
         KillTimer(hDlg, kCtrlPollTimerId);
         KillTimer(hDlg, kHelperFlashTimerId);
+        KillTimer(hDlg, kElapsedTimerId);
+        g_dlgHwnd          = nullptr;
         g_runCtrlDown      = false;
         g_helperRejected   = false;
         g_helperFlashTicks = 0;
@@ -2423,20 +2569,6 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
 // =============================================================================
 //  Main run flow (called from XT_Prepare for non-DBC modes, XT_Finalize for DBC)
 // =============================================================================
-struct RunCtx {
-    HANDLE hVolume   = nullptr;
-    HANDLE hEvidence = nullptr;
-    bool   selectionMode    = false;
-    std::vector<LONG> selected;  // populated by XT_ProcessItem under DBC
-
-    // v0.2.3: track whether the run mutated snapshot state (added Labels,
-    // created an evidence object). XT_Finalize returns 0x02 if so to ask
-    // X-Ways to persist the volume snapshot — saves the analyst a manual
-    // save step. Per 21.3 Preview 3 forum announcement; see
-    // docs/xtension-invocation.md "Return values".
-    bool didMutate = false;
-};
-
 // =============================================================================
 //  RunWorkerEntry — the single post-dialog run body, shared by the standalone
 //  dialog worker thread (pumpMessages=false) and the synchronous managed /
@@ -2712,6 +2844,42 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
     return ok;
 }
 
+// Spawn the run on a detached worker thread (dialog mode). The dialog stays
+// open in a running state; the worker posts WM_APP_DONE when finished. IDOK
+// has already copied the resolved inputs into g_workerCtx / g_workerSettings.
+static void StartBeWorker(HWND hDlg) {
+    g_workerActive.store(true);
+    g_cancelRequested.store(false);     // clear stale state from any prior run
+    g_workerDidMutate.store(false);
+    g_runStartTick = GetTickCount64();
+
+    // Lock out settings + Run. Cancel (IDCANCEL) stays enabled; its label stays
+    // "Cancel" but its semantics flip to abort (handled in IDCANCEL, Phase 3).
+    EnableWindow(GetDlgItem(hDlg, IDOK), FALSE);
+    for (int id : kRunLockIds) {
+        HWND h = GetDlgItem(hDlg, id);
+        if (h) EnableWindow(h, FALSE);
+    }
+    for (int i = 0; i < kNumScanners; ++i) {
+        HWND h = GetDlgItem(hDlg, IDC_SCANNER_BASE + i);
+        if (h) EnableWindow(h, FALSE);
+    }
+    SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS,
+                    L"Running bulk_extractor… 00:00 (see console window)");
+    SetTimer(hDlg, kElapsedTimerId, 1000, nullptr);
+
+    // Detached worker. g_workerCtx / g_workerSettings are stable copies made by
+    // IDOK before this call, so the lambda can read them after IDOK returns.
+    std::thread t([]() {
+        bool didMutate = false;
+        RunWorkerEntry(g_workerCtx, g_workerSettings,
+                       /*pumpMessages=*/false, &didMutate);
+        g_workerDidMutate.store(didMutate);
+        // RunWorkerEntry already PostMessage'd exactly one WM_APP_DONE.
+    });
+    t.detach();
+}
+
 static void RunFlow(HWND parent, RunCtx& ctx) {
     // v0.2.3 guard: per 21.4 SR-5, hVolume passed to XT_Prepare/XT_Finalize is
     // NULL when the X-Tension is invoked from the **Case Root** window. Our
@@ -2894,32 +3062,21 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
         s.inputPath = activeSrc;
     }
 
-    // Show dialog.
+    // Show dialog. The dialog now HOSTS the run on a worker thread
+    // (IDOK -> StartBeWorker); ShowSettingsDialog returns only after the dialog
+    // closes (idle Cancel, or Close after the worker posted WM_APP_DONE).
+    // ctx.didMutate was threaded back into g_run by the WM_APP_DONE handler.
     if (!ShowSettingsDialog(parent, s)) {
-        Log(L"cancelled by user");
+        // Dialog closed. The run (if any) executed on the worker thread.
         return;
     }
-
-    // Phase 1: run synchronously on the calling (UI) thread, pumpMessages=true,
-    // exactly as before the worker-thread refactor. Phase 2 moves this onto a
-    // worker thread started from the dialog's IDOK handler.
-    bool didMutate = false;
-    RunWorkerEntry(ctx, s, /*pumpMessages=*/true, &didMutate);
-    if (didMutate) ctx.didMutate = true;
+    // (Run executed on the worker; ctx.didMutate already set via g_run in the
+    //  WM_APP_DONE handler. Nothing further to do here.)
 }
 
 // =============================================================================
 //  Entry points
 // =============================================================================
-static RunCtx g_run;
-
-// Worker-owned copies of the run inputs. The dialog's Settings* points at
-// ShowSettingsDialog's stack &s; the detached worker outlives that scope, so
-// IDOK copies the resolved settings + run context here before spawning the
-// thread.
-static RunCtx   g_workerCtx;
-static Settings g_workerSettings;
-
 extern "C" {
 
 LONG __stdcall XT_Init(DWORD nVersion, DWORD nFlags, HWND hMainWnd, void*) {
