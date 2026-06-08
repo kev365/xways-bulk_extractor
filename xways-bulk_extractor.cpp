@@ -289,6 +289,22 @@ static void LogVerbose(const std::wstring& m) {
     if (XWF_OutputMessage) XWF_OutputMessage(s.c_str(), 0x08);
 }
 
+// --- Worker -> dialog bridge (PostMessage only) -----------------------------
+//   Guarded on g_dlgHwnd so the SAME RunWorkerEntry body is safe on the
+//   synchronous managed/headless path (g_dlgHwnd is null there -> no-op).
+//   WM_APP_STATUS takes ownership of a heap wchar_t* the handler delete[]s.
+static void PostWorkerStatus(const std::wstring& text) {
+    if (!g_dlgHwnd) return;
+    wchar_t* buf = new wchar_t[text.size() + 1];
+    wmemcpy(buf, text.c_str(), text.size() + 1);
+    PostMessageW(g_dlgHwnd, WM_APP_STATUS, 0, (LPARAM)buf);
+}
+
+// code: 0 = ok, 1 = cancelled, 2 = failed.
+static void PostWorkerDone(int code) {
+    if (g_dlgHwnd) PostMessageW(g_dlgHwnd, WM_APP_DONE, (WPARAM)code, 0);
+}
+
 template <typename T>
 static T Resolve(HMODULE h, const char* name, int& missing) {
     T p = reinterpret_cast<T>(GetProcAddress(h, name));

@@ -52,3 +52,10 @@
 #define IDC_CHK_TAG_SCANNED         153
 #define IDC_CHK_TAG_HITS            154
 #define IDC_CHK_TAG_HITS_PER_FEATURE 155  // sub-option of IDC_CHK_TAG_HITS
+
+// Worker thread posts these to the settings-dialog HWND (handled in
+// SettingsDlgProc). See the in-DLL Cancel design spec.
+//   WM_APP_STATUS: lParam = heap wchar_t* (dialog SetDlgItemText + delete[]).
+//   WM_APP_DONE:   wParam  = 0 ok, 1 cancelled, 2 failed.
+#define WM_APP_STATUS   (WM_APP + 1)
+#define WM_APP_DONE     (WM_APP + 2)
