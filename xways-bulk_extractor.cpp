@@ -1996,7 +1996,8 @@ static std::wstring QuoteIfNeeded(const std::wstring& s) {
 }
 
 static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
-                             DWORD& exitCode, std::wstring& errOut) {
+                             DWORD& exitCode, std::wstring& errOut,
+                             bool pumpMessages) {
     // v0.3.0: translate paths if running via WSL. Output dir + input path
     // are Windows paths (analyst's storage); we map them to /mnt/c/...
     // for the Linux BE. -R-detection (is input a directory?) is done on
@@ -2068,25 +2069,34 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
         return false;
     }
 
-    // v0.3.0: pump the UI message queue while waiting for BE so X-Ways
-    // doesn't get marked "Not Responding" by Windows. WaitForSingleObject
-    // alone blocks this thread (which on a synchronous XT_Prepare invocation
-    // is the X-Ways UI thread), so all paint / input messages back up until
-    // BE finishes. MsgWaitForMultipleObjects + PeekMessage drain is the
-    // standard Win32 fix.
-    for (;;) {
-        DWORD r = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE,
-                                            INFINITE, QS_ALLINPUT);
-        if (r == WAIT_OBJECT_0) break;          // BE finished
-        if (r == WAIT_OBJECT_0 + 1) {           // UI messages waiting
-            MSG msg;
-            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+    // The BE wait is thread-context-aware (in-DLL Cancel design §3.3). On the
+    // X-Ways UI thread (synchronous managed/headless path, pumpMessages=true)
+    // we keep the MsgWaitForMultipleObjects + PeekMessage drain so X-Ways stays
+    // responsive during the BE wait. On a worker thread (dialog mode,
+    // pumpMessages=false) we must NOT pump the UI message queue — a plain timed
+    // WaitForSingleObject poll is used instead.
+    if (pumpMessages) {
+        for (;;) {
+            DWORD r = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE,
+                                                INFINITE, QS_ALLINPUT);
+            if (r == WAIT_OBJECT_0) break;          // BE finished
+            if (r == WAIT_OBJECT_0 + 1) {           // UI messages waiting
+                MSG msg;
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                continue;
             }
-            continue;
+            break;                                   // WAIT_FAILED or unexpected
         }
-        break;                                   // WAIT_FAILED or unexpected
+    } else {
+        for (;;) {
+            DWORD r = WaitForSingleObject(pi.hProcess, 100);
+            if (r == WAIT_OBJECT_0) break;          // BE finished
+            // (Phase 3 adds the g_cancelRequested poll + TerminateProcess here.)
+            if (r != WAIT_TIMEOUT) break;           // WAIT_FAILED or unexpected
+        }
     }
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
@@ -2719,7 +2729,7 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
     // --- Run BE ---------------------------------------------------------
     DWORD exitCode = 0;
     std::wstring runErr;
-    bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr);
+    bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr, /*pumpMessages=*/true);
     {
         wchar_t buf[160];
         swprintf_s(buf, L"bulk_extractor exit code: %lu", (unsigned long)exitCode);
@@ -3223,7 +3233,7 @@ static bool __stdcall BulkExtractorOnFinalize(HANDLE hVolume, HANDLE hEvidence,
     // ---- Run BE synchronously (same leaf helper the standalone path uses).
     DWORD exitCode = 0;
     std::wstring runErr;
-    bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr);
+    bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr, /*pumpMessages=*/true);
     Log(FormatStr(L"bulk_extractor exit code: %lu", (unsigned long)exitCode));
     if (!ok && !runErr.empty()) Log(L"error: " + runErr);
 
