@@ -107,3 +107,36 @@ BEGIN
     PUSHBUTTON      "Run",                                              IDOK,                     283, 448,  50,  14, BS_OWNERDRAW
     PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 448,  50,  14, BS_OWNERDRAW
 END
+
+// =============================================================================
+//  Version resource -- keep FILEVERSION/strings in sync with VERSION in the
+//  .cpp and the README (versioning convention).
+// =============================================================================
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,5,0,0
+ PRODUCTVERSION 0,5,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Kevin Stokes"
+            VALUE "FileDescription",  "bulk_extractor wrapper for X-Ways Forensics"
+            VALUE "FileVersion",      "0.5.0-beta"
+            VALUE "InternalName",     "xways-bulk_extractor"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 Kevin Stokes. MIT License."
+            VALUE "OriginalFilename", "xways-bulk_extractor.dll"
+            VALUE "ProductName",      "xways-bulk_extractor"
+            VALUE "ProductVersion",   "0.5.0-beta"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -68,7 +68,7 @@
 
 // --- Identity ---------------------------------------------------------------
 static const wchar_t* NAME         = L"bulk_extractor";
-static const wchar_t* VERSION      = L"0.4.0-beta";
+static const wchar_t* VERSION      = L"0.5.0-beta";
 static const wchar_t* DESCRIPTION  = L"Run bulk_extractor on an image, path, or selected items; ingest results.";
 static const wchar_t* REPORT_TABLE_SCANNED = L"bulk_extractor scanned";
 static const wchar_t* REPORT_TABLE_HITS    = L"bulk_extractor hits";
@@ -222,22 +222,27 @@ static HMODULE g_hSelf     = nullptr;
 static HWND    g_hMainWnd  = nullptr;
 
 // --- In-DLL Cancel / worker-thread state (v0.5.0) --------------------------
-//   Mirrors xways-ual-timeliner. The settings dialog hosts the run on a
-//   detached std::thread; these atomics bridge the X-Ways UI thread and the
-//   worker. g_dlgHwnd is the PostMessage target (null on the synchronous
-//   managed/headless path -> the Post helpers no-op). g_workerActive blocks
-//   WM_CLOSE while running and gates the Ctrl-to-save poll. g_cancelRequested
-//   is the cooperative-abort flag. g_beChildProcess publishes the in-flight BE
-//   child HANDLE so Cancel can TerminateProcess it from the UI thread.
-//   g_workerDidMutate is the worker's mutate sink (threaded back to
-//   g_run.didMutate in WM_APP_DONE). kElapsedTimerId drives the 1 s
+//   The settings dialog hosts the bulk_extractor run on a JOINABLE
+//   std::thread (g_workerThread) reaped in WM_APP_DONE and, as a safety net,
+//   in XT_Done -- the DLL can never unload with the worker alive. These
+//   atomics bridge the X-Ways UI thread and the worker. g_dlgHwnd is the
+//   PostMessage target (null on the synchronous managed/headless path -> the
+//   Post helpers no-op). g_workerActive blocks WM_CLOSE while running and
+//   gates the Ctrl-to-save poll. g_cancelRequested is the cooperative-abort
+//   flag. g_beChildProcess publishes the in-flight BE child HANDLE so Cancel
+//   can TerminateProcess it from the UI thread.
+//   THREADING GATE (P1): the worker runs ONLY the subprocess phase
+//   (ExecuteBeRun) -- every XWF_* call stays on X-Ways' own thread: input
+//   prep (item extraction + tag-scanned labels) in IDOK before the worker
+//   starts, post-processing (CreateEvObj + Label tagging + temp cleanup) in
+//   the WM_APP_DONE handler after it finishes. kElapsedTimerId drives the 1 s
 //   "Running... mm:ss" status clock (distinct from kCtrlPollTimerId 0xBE10 /
 //   kHelperFlashTimerId 0xBE12).
 static constexpr UINT_PTR  kElapsedTimerId = 0xBE14;
 static std::atomic<bool>   g_workerActive{false};
 static std::atomic<bool>   g_cancelRequested{false};
-static std::atomic<bool>   g_workerDidMutate{false};
 static std::atomic<HANDLE> g_beChildProcess{nullptr};
+static std::thread         g_workerThread;   // joinable; see comment above
 static HWND                g_dlgHwnd = nullptr;
 static ULONGLONG           g_runStartTick = 0;
 
@@ -1105,6 +1110,25 @@ static RunCtx g_run;
 static RunCtx   g_workerCtx;
 static Settings g_workerSettings;
 
+// --- Split run phases (threading gate) --------------------------------------
+//   A: PrepareRunInput -- XWF reads + tag-scanned labels (X-Ways thread ONLY)
+//   B: ExecuteBeRun    -- validate/spawn/wait bulk_extractor (worker-safe)
+//   C: PostProcessRun  -- XWF mutations + temp cleanup (X-Ways thread ONLY)
+//   Definitions live next to RunWorkerEntry, the synchronous A->B->C wrapper
+//   used by the managed/headless path.
+struct RunPrep {
+    std::wstring inputForBE;
+    std::wstring tempInputDir;      // SelectedItems only; empty otherwise
+    bool         didMutate = false; // tag-scanned labels applied during export
+};
+enum class RunOutcome { PrereqFailed, RanOk, RanFailed };
+static bool       PrepareRunInput(const RunCtx& ctx, const Settings& s, RunPrep& prep);
+static RunOutcome ExecuteBeRun(const Settings& s, const RunPrep& prep,
+                               bool pumpMessages, DWORD& exitCodeOut);
+static void       PostProcessRun(const Settings& s, const RunPrep& prep,
+                                 bool beRanOk, bool* outDidMutate);
+static RunPrep g_workerPrep;  // dialog path: filled by IDOK, read by worker + WM_APP_DONE
+
 // Enable/disable controls based on the selected input radio.
 static void UpdateInputState(HWND hDlg, const Settings* s) {
     bool isPick     = IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_PICK)     == BST_CHECKED;
@@ -1834,10 +1858,20 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
 
             // Copy resolved settings + run context into worker-owned storage
             // (the modal Settings* points at ShowSettingsDialog's stack &s that
-            // the detached worker must not depend on). g_run holds
+            // the worker must not depend on). g_run holds
             // hVolume/hEvidence/selected for the standalone path; mirror it.
             g_workerSettings = *s;
             g_workerCtx      = g_run;
+
+            // Phase A on X-Ways' thread (threading gate): SelectedItems
+            // extraction reads item bytes via XWF_OpenItem/Read and may tag
+            // via XWF_Label -- none of that may run on the worker. On failure
+            // the status line already carries the reason; stay idle.
+            g_workerPrep = RunPrep{};
+            if (!PrepareRunInput(g_workerCtx, g_workerSettings, g_workerPrep)) {
+                return TRUE;
+            }
+            if (g_workerPrep.didMutate) g_run.didMutate = true;
 
             StartBeWorker(hDlg);
             return TRUE;
@@ -1889,13 +1923,34 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         return TRUE;
     }
     case WM_APP_DONE: {
-        // wp: 0 ok, 1 cancelled, 2 failed.
+        // wp: 0 ok, 1 cancelled, 2 BE failed, 3 prereq failed (no run -- the
+        // specific failure text is already on the status line).
+        // P2: reap the worker first -- it posted this message as its last
+        // real work, so the join returns almost immediately.
+        if (g_workerThread.joinable()) g_workerThread.join();
         g_workerActive.store(false);
         KillTimer(hDlg, kElapsedTimerId);
         g_beChildProcess.store(nullptr);
 
-        // Thread the worker's mutate flag back so XT_Finalize can return 0x02.
-        if (g_workerDidMutate.load()) g_run.didMutate = true;
+        // Phase C on X-Ways' thread (threading gate): the XWF-mutating
+        // post-processing (CreateEvObj + Label tagging) and temp cleanup run
+        // HERE, not on the worker. Skipped when the run never started (wp 3).
+        {
+            bool didMutate = false;
+            if (wp != 3) {
+                PostProcessRun(g_workerSettings, g_workerPrep, wp == 0, &didMutate);
+                if (wp == 1) Log(L"Run cancelled by user.");
+            }
+            if (didMutate) g_run.didMutate = true;
+        }
+        switch (wp) {
+        case 0: SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS,
+                    L"Done. See Messages window for the run summary."); break;
+        case 1: SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"Cancelled."); break;
+        case 2: SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS,
+                    L"Failed: bulk_extractor returned a nonzero exit code (see Messages)."); break;
+        default: break;  // 3: specific failure text already shown
+        }
 
         // Re-enable Run + settings + the scanner checkboxes (inverse of
         // StartBeWorker). IDCANCEL is re-enabled explicitly (it is not in
@@ -2570,26 +2625,24 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
 //  Main run flow (called from XT_Prepare for non-DBC modes, XT_Finalize for DBC)
 // =============================================================================
 // =============================================================================
-//  RunWorkerEntry — the single post-dialog run body, shared by the standalone
-//  dialog worker thread (pumpMessages=false) and the synchronous managed /
-//  headless caller (pumpMessages=true). Resolves the input, validates + gates
-//  the BE binary, makes the output dir, spawns BE, then post-processes (open
-//  folder, add-as-evidence, feature-file hit tagging) and cleans up the
-//  selected-items temp dir. Error/reject paths Log() only (no MessageBox) so
-//  the same body is safe on a worker thread and on the no-modal managed path.
-//  Mutate-status is reported via *outDidMutate (caller threads it to its own
-//  sink: g_run.didMutate / a managed local).
-//
-//  Inputs come from ctx (hVolume/hEvidence/selected) and s (inputMode/inputPath/
-//  outputDir/binary/flags). For ActiveEoImage the source path is read from
-//  s.inputPath (RunFlow + the managed path both populate it before calling).
+//  The run body, split into three phases so the dialog's worker thread never
+//  touches the XWF_* API (threading gate):
+//    A  PrepareRunInput -- resolve the input; SelectedItems extracts item
+//       bytes (XWF_OpenItem/Read) and may tag via XWF_Label. X-Ways thread.
+//    B  ExecuteBeRun    -- validate + identity-gate the BE binary, create the
+//       output dir, spawn bulk_extractor and wait. No XWF calls beyond Log()
+//       (XWF_OutputMessage, thread-tolerant); safe on the worker thread.
+//    C  PostProcessRun  -- open folder, add-as-evidence (XWF_CreateEvObj),
+//       feature-file hit tagging (XWF_Label), temp-dir cleanup. X-Ways thread.
+//  Dialog path: A runs in IDOK, B on the worker, C in WM_APP_DONE.
+//  Managed/headless path: RunWorkerEntry below runs A->B->C synchronously on
+//  the caller's (X-Ways) thread, exactly as before.
+//  Error/reject paths Log() only (no MessageBox) so every phase is safe on
+//  the no-modal managed path. Mutate-status is reported via prep.didMutate /
+//  *outDidMutate (callers thread it to g_run.didMutate / a managed local).
 // =============================================================================
-static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
-                           bool pumpMessages, bool* outDidMutate) {
-    // --- Resolve inputPath based on mode --------------------------------
-    std::wstring inputForBE;
-    std::wstring tempInputDir;  // populated only for SelectedItems
 
+static bool PrepareRunInput(const RunCtx& ctx, const Settings& s, RunPrep& prep) {
     switch (s.inputMode) {
     case InputMode::ActiveEoImage: {
         std::wstring p = TrimW(s.inputPath);
@@ -2597,10 +2650,9 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
             Log(L"This evidence object does not expose a source path "
                 L"(common for physical-disk EOs). Use 'Pick file or directory' instead.");
             PostWorkerStatus(L"Failed: evidence object has no source path.");
-            PostWorkerDone(2);
             return false;
         }
-        inputForBE = p;
+        prep.inputForBE = p;
         break;
     }
     case InputMode::PickPath: {
@@ -2608,17 +2660,15 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         if (p.empty() || (!FileExists(p) && !DirExists(p))) {
             Log(L"Input path does not exist.");
             PostWorkerStatus(L"Failed: input path does not exist.");
-            PostWorkerDone(2);
             return false;
         }
-        inputForBE = p;
+        prep.inputForBE = p;
         break;
     }
     case InputMode::SelectedItems: {
         if (ctx.selected.empty()) {
             Log(L"No items were selected.");
             PostWorkerStatus(L"Failed: no items selected.");
-            PostWorkerDone(2);
             return false;
         }
         Log(L"exporting selected items to temp dir...");
@@ -2627,7 +2677,6 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         if (er.tempDir.empty() || er.exported == 0) {
             Log(L"Failed to export selected items to temp dir.");
             PostWorkerStatus(L"Failed: could not export selected items.");
-            PostWorkerDone(2);
             return false;
         }
         wchar_t buf[160];
@@ -2647,13 +2696,19 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
             swprintf_s(buf, L"  tagged %d item(s) as \"%s\"",
                        er.taggedScanned, REPORT_TABLE_SCANNED);
             Log(buf);
-            if (outDidMutate) *outDidMutate = true;
+            prep.didMutate = true;
         }
-        tempInputDir = er.tempDir;
-        inputForBE   = er.tempDir;
+        prep.tempInputDir = er.tempDir;
+        prep.inputForBE   = er.tempDir;
         break;
     }
     }
+    return true;
+}
+
+static RunOutcome ExecuteBeRun(const Settings& s, const RunPrep& prep,
+                               bool pumpMessages, DWORD& exitCodeOut) {
+    const std::wstring& inputForBE = prep.inputForBE;
 
     // --- Validate BE binary --------------------------------------------
     // WSL mode: the binary lives in the Linux filesystem, not on Windows
@@ -2668,21 +2723,20 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         Log(L"bulk_extractor binary path is empty or does not point to a real file "
             L"— set it in the dialog / cfg.");
         PostWorkerStatus(L"Failed: bulk_extractor binary not found.");
-        PostWorkerDone(2);
-        return false;
+        return RunOutcome::PrereqFailed;
     }
 
     // v0.4.0: final identity gate before spawn (native mode only — the WSL
     // binary can't be inspected from Windows). Reject hard — log the reason
     // verbatim and bail rather than launch some other exe with the BE CLI shape.
+    // (PE VERSIONINFO + banner probe of a file on disk — no XWF calls.)
     if (!s.useWsl) {
         std::wstring idDetail;
         if (!VerifyHelperIdentity(s.beBinary, kHelperIdentityNeedle, idDetail)) {
             Log(L"REJECTED native bulk_extractor binary before run (" +
                 s.beBinary + L") — " + idDetail);
             PostWorkerStatus(L"Failed: not a valid bulk_extractor binary.");
-            PostWorkerDone(2);
-            return false;
+            return RunOutcome::PrereqFailed;
         }
         Log(L"bulk_extractor binary verified before run (" + s.beBinary + L") — " + idDetail);
     }
@@ -2699,12 +2753,11 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
         }
         if (!DirExists(s.outputDir)) {
             Log(L"Failed to create output directory: " + s.outputDir);
-            if (!tempInputDir.empty()) {
-                Log(L"selected-items temp dir KEPT (output dir failed) at: " + tempInputDir);
+            if (!prep.tempInputDir.empty()) {
+                Log(L"selected-items temp dir KEPT (output dir failed) at: " + prep.tempInputDir);
             }
             PostWorkerStatus(L"Failed: could not create output directory.");
-            PostWorkerDone(2);
-            return false;
+            return RunOutcome::PrereqFailed;
         }
     }
     // BE refuses to run if the output dir already contains BE artifacts. We
@@ -2716,18 +2769,20 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
     }
 
     // --- Run BE ---------------------------------------------------------
-    DWORD exitCode = 0;
     std::wstring runErr;
     PostWorkerStatus(L"Running bulk_extractor… (see console window)");
-    bool ok = RunBulkExtractor(s, inputForBE, exitCode, runErr, pumpMessages);
+    bool ok = RunBulkExtractor(s, inputForBE, exitCodeOut, runErr, pumpMessages);
     {
         wchar_t buf[160];
-        swprintf_s(buf, L"bulk_extractor exit code: %lu", (unsigned long)exitCode);
+        swprintf_s(buf, L"bulk_extractor exit code: %lu", (unsigned long)exitCodeOut);
         Log(buf);
     }
     if (!ok && !runErr.empty()) Log(L"error: " + runErr);
+    return ok ? RunOutcome::RanOk : RunOutcome::RanFailed;
+}
 
-    // --- Post-processing -----------------------------------------------
+static void PostProcessRun(const Settings& s, const RunPrep& prep,
+                           bool beRanOk, bool* outDidMutate) {
     if (s.openFolder) OpenInExplorer(s.outputDir);
 
     if (s.addToCase) {
@@ -2811,19 +2866,41 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
     }
 
     // v0.2.4: cleanup the selected-items export temp dir.
-    if (!tempInputDir.empty()) {
-        if (ok && !s.keepTempDir) {
-            if (DeleteDirRecursive(tempInputDir)) {
-                Log(L"selected-items temp dir cleaned up: " + tempInputDir);
+    if (!prep.tempInputDir.empty()) {
+        if (beRanOk && !s.keepTempDir) {
+            if (DeleteDirRecursive(prep.tempInputDir)) {
+                Log(L"selected-items temp dir cleaned up: " + prep.tempInputDir);
             } else {
-                Log(L"selected-items temp dir cleanup FAILED at: " + tempInputDir);
+                Log(L"selected-items temp dir cleanup FAILED at: " + prep.tempInputDir);
             }
-        } else if (!ok) {
-            Log(L"selected-items temp dir KEPT (BE failed) at: " + tempInputDir);
+        } else if (!beRanOk) {
+            Log(L"selected-items temp dir KEPT (BE failed) at: " + prep.tempInputDir);
         } else {
-            Log(L"selected-items temp dir KEPT (keep_temp_dir=true) at: " + tempInputDir);
+            Log(L"selected-items temp dir KEPT (keep_temp_dir=true) at: " + prep.tempInputDir);
         }
     }
+}
+
+// Synchronous A->B->C wrapper — the managed/headless path (and any caller
+// already on X-Ways' thread). Post* helpers no-op there (g_dlgHwnd is null).
+static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
+                           bool pumpMessages, bool* outDidMutate) {
+    RunPrep prep;
+    if (!PrepareRunInput(ctx, s, prep)) {
+        PostWorkerDone(3);
+        return false;
+    }
+    if (prep.didMutate && outDidMutate) *outDidMutate = true;
+
+    DWORD exitCode = 0;
+    RunOutcome oc = ExecuteBeRun(s, prep, pumpMessages, exitCode);
+    if (oc == RunOutcome::PrereqFailed) {
+        PostWorkerDone(3);
+        return false;
+    }
+    bool ok = (oc == RunOutcome::RanOk);
+
+    PostProcessRun(s, prep, ok, outDidMutate);
 
     // --- Completion epilogue: post exactly one DONE so the dialog returns to
     //     idle. (g_cancelRequested gains real in-loop checks + TerminateProcess
@@ -2844,13 +2921,13 @@ static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
     return ok;
 }
 
-// Spawn the run on a detached worker thread (dialog mode). The dialog stays
-// open in a running state; the worker posts WM_APP_DONE when finished. IDOK
-// has already copied the resolved inputs into g_workerCtx / g_workerSettings.
+// Spawn the subprocess phase on a JOINABLE worker thread (dialog mode). The
+// dialog stays open in a running state; the worker posts WM_APP_DONE when
+// finished and is joined there (P2). IDOK has already run Phase A and copied
+// the resolved inputs into g_workerSettings / g_workerPrep.
 static void StartBeWorker(HWND hDlg) {
     g_workerActive.store(true);
     g_cancelRequested.store(false);     // clear stale state from any prior run
-    g_workerDidMutate.store(false);
     g_runStartTick = GetTickCount64();
 
     // Lock out settings + Run. Cancel (IDCANCEL) stays enabled; its label stays
@@ -2868,16 +2945,23 @@ static void StartBeWorker(HWND hDlg) {
                     L"Running bulk_extractor… 00:00 (see console window)");
     SetTimer(hDlg, kElapsedTimerId, 1000, nullptr);
 
-    // Detached worker. g_workerCtx / g_workerSettings are stable copies made by
-    // IDOK before this call, so the lambda can read them after IDOK returns.
-    std::thread t([]() {
-        bool didMutate = false;
-        RunWorkerEntry(g_workerCtx, g_workerSettings,
-                       /*pumpMessages=*/false, &didMutate);
-        g_workerDidMutate.store(didMutate);
-        // RunWorkerEntry already PostMessage'd exactly one WM_APP_DONE.
+    // JOINABLE worker (P2) running ONLY the subprocess phase (P1 -- no XWF_*
+    // calls off X-Ways' thread). g_workerSettings / g_workerPrep are stable
+    // copies made by IDOK before this call, so the lambda can read them after
+    // IDOK returns. Reaped in WM_APP_DONE (and XT_Done as a safety net).
+    if (g_workerThread.joinable()) g_workerThread.join();  // reap any prior run
+    g_workerThread = std::thread([]() {
+        DWORD exitCode = 0;
+        RunOutcome oc = ExecuteBeRun(g_workerSettings, g_workerPrep,
+                                     /*pumpMessages=*/false, exitCode);
+        int code;
+        if (oc == RunOutcome::PrereqFailed) code = 3;
+        else if (g_cancelRequested.load())  code = 1;
+        else if (oc == RunOutcome::RanOk)   code = 0;
+        else                                code = 2;
+        PostWorkerDone(code);   // exactly one DONE per run; Phase C + the
+                                // final status text happen in the handler
     });
-    t.detach();
 }
 
 static void RunFlow(HWND parent, RunCtx& ctx) {
@@ -3132,7 +3216,17 @@ LONG __stdcall XT_Finalize(HANDLE, HANDLE, DWORD nOpType, void*) {
     return didMutate ? 0x02 : 0;
 }
 
-LONG __stdcall XT_Done(void*) { Log(L"XT_Done"); return 0; }
+LONG __stdcall XT_Done(void*) {
+    // P2 safety net: never let X-Ways unload the DLL while the worker thread
+    // is alive (FreeLibrary with a running thread in DLL code = crash).
+    if (g_workerThread.joinable()) {
+        Log(L"XT_Done: waiting for the bulk_extractor worker to finish...");
+        g_cancelRequested.store(true);
+        g_workerThread.join();
+    }
+    Log(L"XT_Done");
+    return 0;
+}
 
 }  // extern "C"
 
