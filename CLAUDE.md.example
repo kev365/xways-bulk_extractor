@@ -1,0 +1,91 @@
+# xways-bulk_extractor — Claude Code notes
+
+> **Per-X-Tension instructions for Claude Code.** Copy this file to `CLAUDE.md`
+> (git-ignored) in this folder and tailor it for your environment. Claude reads
+> `CLAUDE.md` as directory-level instructions. Keep this committed `.example`
+> **generic — no local paths, credentials, or case data.**
+>
+> Project-wide rules live in the repo-root `CLAUDE.md` and the authoring skill
+> (`xways-xtension-authoring`). This file captures only what is specific to
+> **xways-bulk_extractor**.
+
+## What this X-Tension is
+
+Wrapper around Simson Garfinkel's `bulk_extractor` for X-Ways Forensics.
+Three input modes (active evidence-object image, picked file/dir, right-click
+selected items) and three output integrations (add output dir to the case via
+`XWF_CreateEvObj`, open in Explorer, feature-file hit tagging via `XWF_Label`).
+
+- **Stem / DLL:** `xways-bulk_extractor` → `xways-bulk_extractor.dll`
+- **Version:** `0.5.0-beta` — keep `VERSION` in the `.cpp`, the `.rc`
+  VERSIONINFO, and the README in lockstep (versioning convention).
+- **Identity constants** (top of `xways-bulk_extractor.cpp`): `NAME`,
+  `VERSION`, `DESCRIPTION`, `REPORT_TABLE_HITS`, `REPORT_TABLE_SCANNED`.
+
+## Build
+
+```powershell
+<path-to-skill>/scripts/build-xtension.ps1 -Name xways-bulk_extractor
+```
+
+Close X-Ways first — the DLL is locked while it runs (no hot reload).
+
+## Threading model (do not regress)
+
+The settings dialog hosts the run on a **joinable** worker thread
+(`g_workerThread`), but the worker runs **only the subprocess phase**
+(`ExecuteBeRun`). Every `XWF_*` call stays on X-Ways' own thread:
+
+- **A `PrepareRunInput`** — item extraction + tag-scanned labels; runs in the
+  IDOK handler before the worker starts.
+- **B `ExecuteBeRun`** — validate/identity-gate the binary, spawn/wait BE;
+  the only phase on the worker. Watches `g_cancelRequested` every 100 ms and
+  `TerminateProcess`es the child on cancel.
+- **C `PostProcessRun`** — `XWF_CreateEvObj`, feature-hit `XWF_Label`
+  tagging, temp cleanup; runs in the `WM_APP_DONE` handler.
+
+The worker is reaped in `WM_APP_DONE` and (safety net) in `XT_Done` — never
+detach it, and never move an `XWF_*` call into phase B.
+
+## Wrapped tool / dependencies
+
+- **bulk_extractor v2.x** for Windows — analyst supplies the binary
+  (`bulk_extractor64.exe` next to the DLL is auto-detected; cfg `be_binary`
+  overrides). Identity gate: PE VERSIONINFO / `-h` banner needle
+  `bulk_extractor` (`VerifyHelperIdentity`), enforced at Browse, the IDOK
+  pre-run gate, and inside `ExecuteBeRun`.
+- **WSL mode** (optional): runs a Linux `bulk_extractor` via `wsl.exe`
+  (cfg `wsl_be_binary` / auto-detection). The Linux binary cannot be
+  PE-inspected from Windows — the identity gate only applies to native mode.
+
+## Config & sidecar files
+
+`bulk_extractor.cfg` next to the DLL (live cfg is git-ignored; only
+`xways-bulk_extractor.cfg.example` is committed). Keys: `be_binary`,
+`wsl_be_binary`, `use_wsl_default`, `keep_temp_dir`, `default_output_dir`
+(intentionally **not** written on save — output follows the case:
+`<caseRoot>\xways-bulk_extractor\…`).
+
+## Gotchas / notes
+
+- BE refuses to run into a non-empty output dir — the X-Tension suggests a
+  fresh per-run subdir and just logs BE's refusal otherwise.
+- Selected-items mode needs a volume handle: invoked from the Case Root
+  window, `hVolume` is NULL (21.4 SR-5 behavior) and the run is refused with
+  an explanation.
+- Selected-items extraction happens on the UI thread before the worker
+  starts, so a huge right-click selection blocks the dialog during export —
+  the long BE run itself is async and cancellable.
+- `XT_Finalize` returns `0x02` ("save volume snapshot") when the run added
+  labels or an evidence object.
+
+## Conventions in play
+
+Output directory, verbose logging, helper-exe verification, Ctrl-to-save
+(Ctrl+Run = save cfg, Ctrl+Close = Save as…), subprocess stdio, add-output-
+to-case — see the authoring skill's `docs/conventions/`.
+
+## Don't commit
+
+Compiled `xways-bulk_extractor.dll`, `bulk_extractor64.exe`, live `.cfg`,
+local paths (`C:\Users\…`), or case data. See the repo-hygiene convention.

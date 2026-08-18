@@ -226,11 +226,13 @@ static HWND    g_hMainWnd  = nullptr;
 //   std::thread (g_workerThread) reaped in WM_APP_DONE and, as a safety net,
 //   in XT_Done -- the DLL can never unload with the worker alive. These
 //   atomics bridge the X-Ways UI thread and the worker. g_dlgHwnd is the
-//   PostMessage target (null on the synchronous managed/headless path -> the
-//   Post helpers no-op). g_workerActive blocks WM_CLOSE while running and
+//   PostMessage target (null when no dialog is up -> the Post helpers
+//   no-op). g_workerActive blocks WM_CLOSE while running and
 //   gates the Ctrl-to-save poll. g_cancelRequested is the cooperative-abort
-//   flag. g_beChildProcess publishes the in-flight BE child HANDLE so Cancel
-//   can TerminateProcess it from the UI thread.
+//   flag: IDCANCEL sets it during a run; the worker's 100 ms wait loop sees
+//   it, TerminateProcess()es the BE child (the worker owns the process
+//   handle, so there is no cross-thread handle-lifetime race), and unwinds
+//   through WM_APP_DONE code 1.
 //   THREADING GATE (P1): the worker runs ONLY the subprocess phase
 //   (ExecuteBeRun) -- every XWF_* call stays on X-Ways' own thread: input
 //   prep (item extraction + tag-scanned labels) in IDOK before the worker
@@ -241,7 +243,6 @@ static HWND    g_hMainWnd  = nullptr;
 static constexpr UINT_PTR  kElapsedTimerId = 0xBE14;
 static std::atomic<bool>   g_workerActive{false};
 static std::atomic<bool>   g_cancelRequested{false};
-static std::atomic<HANDLE> g_beChildProcess{nullptr};
 static std::thread         g_workerThread;   // joinable; see comment above
 static HWND                g_dlgHwnd = nullptr;
 static ULONGLONG           g_runStartTick = 0;
@@ -295,8 +296,7 @@ static void LogVerbose(const std::wstring& m) {
 }
 
 // --- Worker -> dialog bridge (PostMessage only) -----------------------------
-//   Guarded on g_dlgHwnd so the SAME RunWorkerEntry body is safe on the
-//   synchronous managed/headless path (g_dlgHwnd is null there -> no-op).
+//   Guarded on g_dlgHwnd (null when no dialog is up -> no-op).
 //   WM_APP_STATUS takes ownership of a heap wchar_t* the handler delete[]s.
 static void PostWorkerStatus(const std::wstring& text) {
     if (!g_dlgHwnd) return;
@@ -913,43 +913,6 @@ struct Settings {
     bool         selectionMode    = false;   // controls whether the Selected radio is enabled / preselected
 };
 
-// --- Managed-mode (xways-xt-manager) state ---------------------------------
-//   When this DLL is hosted by xways-xt-manager (instead of loaded directly by
-//   X-Ways), the manager creates the embedded settings dialog with lParam=0.
-//   SettingsDlgProc's WM_INITDIALOG needs a Settings* to populate the controls
-//   and the IDOK handler needs one to read them back; in managed mode they
-//   fall back to this module-local object.
-//
-//   Lifecycle (mirrors the standalone XT_Prepare -> XT_ProcessItem ->
-//   XT_Finalize -> RunFlow flow, but driven by the manager's On* callbacks;
-//   modelled on xways-trufflehog's g_managed_* bridge — same per-item-COLLECT +
-//   BATCH-run shape):
-//     BulkExtractorOnInit      -> resolve XWF_*, set g_managed_mode, prime
-//                                 g_managed_settings from cfg + bundled-binary
-//                                 defaults so the embedded dialog shows sane
-//                                 values at first display.
-//     BulkExtractorHarvestSettings -> read the embedded dialog's controls back
-//                                 into g_managed_settings (mirror the IDOK
-//                                 reader; no EndDialog, no modal).
-//     BulkExtractorOnPrepare   -> reset g_managed_collected + stash volume/
-//                                 evidence handles; return true so the manager
-//                                 fans out per-item callbacks.
-//     BulkExtractorOnProcessItem -> collect item IDs (mirror XT_ProcessItem).
-//     BulkExtractorOnFinalize  -> THE BATCH RUN POINT. Build a Settings + the
-//                                 selected-item list, run the helper-exe
-//                                 identity gate, then run bulk_extractor
-//                                 SYNCHRONOUSLY (no modal dialog) by delegating
-//                                 to the SAME leaf helpers RunFlow uses
-//                                 (ExportSelectedItems / RunBulkExtractor /
-//                                 AddOutputAsEvidence / CollectHitsByFeature).
-//
-//   on_finalize (not on_prepare) runs the scan because the selected-items mode
-//   needs the full item set, which only exists after the last on_process_item
-//   call — same reasoning as trufflehog. The non-selected input modes
-//   (active-EO image / pick-path) don't need the item list, but routing every
-//   managed run through on_finalize keeps one code path.
-static bool      g_managed_mode = false;
-static Settings  g_managed_settings;
 
 static void DlgGetText(HWND h, int id, std::wstring& out) {
     HWND c = GetDlgItem(h, id);
@@ -1114,8 +1077,6 @@ static Settings g_workerSettings;
 //   A: PrepareRunInput -- XWF reads + tag-scanned labels (X-Ways thread ONLY)
 //   B: ExecuteBeRun    -- validate/spawn/wait bulk_extractor (worker-safe)
 //   C: PostProcessRun  -- XWF mutations + temp cleanup (X-Ways thread ONLY)
-//   Definitions live next to RunWorkerEntry, the synchronous A->B->C wrapper
-//   used by the managed/headless path.
 struct RunPrep {
     std::wstring inputForBE;
     std::wstring tempInputDir;      // SelectedItems only; empty otherwise
@@ -1174,21 +1135,16 @@ static const int kRunLockIds[] = {
     IDC_CHK_TAG_SCANNED, IDC_CHK_TAG_HITS, IDC_CHK_TAG_HITS_PER_FEATURE,
 };
 
-// Forward declaration — definition lives after RunWorkerEntry (which the
-// worker lambda inside StartBeWorker calls).
+// Forward declaration — definition lives after the split run phases (the
+// worker lambda inside StartBeWorker calls ExecuteBeRun).
 static void StartBeWorker(HWND hDlg);
 
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     static Settings* s = nullptr;
     switch (msg) {
     case WM_INITDIALOG: {
-        // Standalone passes a Settings* via DialogBoxParamW's lParam. Managed
-        // mode (xways-xt-manager host) creates the embedded dialog with
-        // lParam=0 — fall back to the module-local managed settings so the
-        // dialog populates from cfg/bundled defaults and BulkExtractorHarvest-
-        // Settings has somewhere to read the controls back into. Mirrors
-        // xways-trufflehog's WM_INITDIALOG lParam guard.
-        s = lp ? reinterpret_cast<Settings*>(lp) : &g_managed_settings;
+        // ShowSettingsDialog passes a Settings* via DialogBoxParamW's lParam.
+        s = reinterpret_cast<Settings*>(lp);
         if (!s) return TRUE;
 
         // v0.2.13: append the X-Tension version to the dialog title bar
@@ -1513,7 +1469,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         g_dlgHwnd = hDlg;
         g_workerActive.store(false);
         g_cancelRequested.store(false);
-        g_beChildProcess.store(nullptr);
         g_runStartTick = 0;
 
         SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"");
@@ -1877,11 +1832,21 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             return TRUE;
         }
         case IDCANCEL: {
-            // v0.5.0 (Phase 2 safety): while a run is active, Cancel/Esc must NOT
-            // close the dialog out from under the detached worker thread. A real
-            // Cancel-as-abort (set g_cancelRequested + TerminateProcess) replaces
-            // this guard in the Cancel phase. For now, just swallow it.
-            if (g_workerActive.load()) return TRUE;
+            // Phase 3: while a run is active, Cancel = cooperative abort.
+            // First click sets g_cancelRequested; the worker's 100 ms wait
+            // loop terminates the BE child and unwinds via WM_APP_DONE
+            // (code 1), which re-enables this button. Disabled meanwhile so
+            // it can't double-fire; the dialog still cannot close mid-run
+            // (WM_CLOSE guard).
+            if (g_workerActive.load()) {
+                if (!g_cancelRequested.load()) {
+                    g_cancelRequested.store(true);
+                    EnableWindow(GetDlgItem(hDlg, IDCANCEL), FALSE);
+                    SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"Cancelling…");
+                    Log(L"Cancel requested — stopping bulk_extractor…");
+                }
+                return TRUE;
+            }
 
             // v0.4.0: Ctrl+Close = "Save as..." — pick a .cfg path and write
             // the current settings there, then close. The export is a copy;
@@ -1930,7 +1895,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         if (g_workerThread.joinable()) g_workerThread.join();
         g_workerActive.store(false);
         KillTimer(hDlg, kElapsedTimerId);
-        g_beChildProcess.store(nullptr);
 
         // Phase C on X-Ways' thread (threading gate): the XWF-mutating
         // post-processing (CreateEvObj + Label tagging) and temp cleanup run
@@ -2332,8 +2296,17 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
         for (;;) {
             DWORD r = WaitForSingleObject(pi.hProcess, 100);
             if (r == WAIT_OBJECT_0) break;          // BE finished
-            // (Phase 3 adds the g_cancelRequested poll + TerminateProcess here.)
             if (r != WAIT_TIMEOUT) break;           // WAIT_FAILED or unexpected
+            // Phase 3: cooperative cancel. IDCANCEL set the flag on the UI
+            // thread; terminate BE here on the worker, which owns the process
+            // handle, then fall through to the normal exit-code path (the
+            // caller maps cancelRequested to WM_APP_DONE code 1).
+            if (g_cancelRequested.load()) {
+                Log(L"cancel: terminating bulk_extractor child process...");
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 5000);
+                break;
+            }
         }
     }
     GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -2635,11 +2608,9 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
 //    C  PostProcessRun  -- open folder, add-as-evidence (XWF_CreateEvObj),
 //       feature-file hit tagging (XWF_Label), temp-dir cleanup. X-Ways thread.
 //  Dialog path: A runs in IDOK, B on the worker, C in WM_APP_DONE.
-//  Managed/headless path: RunWorkerEntry below runs A->B->C synchronously on
-//  the caller's (X-Ways) thread, exactly as before.
-//  Error/reject paths Log() only (no MessageBox) so every phase is safe on
-//  the no-modal managed path. Mutate-status is reported via prep.didMutate /
-//  *outDidMutate (callers thread it to g_run.didMutate / a managed local).
+//  Error/reject paths Log() only (no MessageBox). Mutate-status is reported
+//  via prep.didMutate / *outDidMutate (threaded to g_run.didMutate so
+//  XT_Finalize can return 0x02).
 // =============================================================================
 
 static bool PrepareRunInput(const RunCtx& ctx, const Settings& s, RunPrep& prep) {
@@ -2879,46 +2850,6 @@ static void PostProcessRun(const Settings& s, const RunPrep& prep,
             Log(L"selected-items temp dir KEPT (keep_temp_dir=true) at: " + prep.tempInputDir);
         }
     }
-}
-
-// Synchronous A->B->C wrapper — the managed/headless path (and any caller
-// already on X-Ways' thread). Post* helpers no-op there (g_dlgHwnd is null).
-static bool RunWorkerEntry(const RunCtx& ctx, const Settings& s,
-                           bool pumpMessages, bool* outDidMutate) {
-    RunPrep prep;
-    if (!PrepareRunInput(ctx, s, prep)) {
-        PostWorkerDone(3);
-        return false;
-    }
-    if (prep.didMutate && outDidMutate) *outDidMutate = true;
-
-    DWORD exitCode = 0;
-    RunOutcome oc = ExecuteBeRun(s, prep, pumpMessages, exitCode);
-    if (oc == RunOutcome::PrereqFailed) {
-        PostWorkerDone(3);
-        return false;
-    }
-    bool ok = (oc == RunOutcome::RanOk);
-
-    PostProcessRun(s, prep, ok, outDidMutate);
-
-    // --- Completion epilogue: post exactly one DONE so the dialog returns to
-    //     idle. (g_cancelRequested gains real in-loop checks + TerminateProcess
-    //     in Phase 3; here it's only set if Cancel was clicked during the run.)
-    if (g_cancelRequested.load()) {
-        Log(L"Run cancelled by user.");
-        PostWorkerStatus(L"Cancelled.");
-        PostWorkerDone(1);
-        return false;
-    }
-    if (ok) {
-        PostWorkerStatus(L"Done. See Messages window for the run summary.");
-        PostWorkerDone(0);
-    } else {
-        PostWorkerStatus(L"Failed: bulk_extractor returned a nonzero exit code (see Messages).");
-        PostWorkerDone(2);
-    }
-    return ok;
 }
 
 // Spawn the subprocess phase on a JOINABLE worker thread (dialog mode). The
@@ -3233,288 +3164,4 @@ LONG __stdcall XT_Done(void*) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) g_hSelf = hModule;
     return TRUE;
-}
-
-// =============================================================================
-//  Manager-plugin integration (xways-xt-manager)
-// =============================================================================
-//   Lets the SAME DLL load as a plugin under xways-xt-manager. The manager
-//   finds us via the XwaysManagerPluginEntry export below. The On* callbacks
-//   delegate to the EXISTING standalone leaf helpers (RetrieveFunctionPointers,
-//   LoadCfg, ExportSelectedItems, RunBulkExtractor, AddOutputAsEvidence,
-//   CollectHitsByFeature, VerifyHelperIdentity) — managed mode never shows the
-//   modal settings dialog. The embedded tab the manager already hosts handles
-//   settings, and BulkExtractorHarvestSettings reads them back.
-//
-//   Run model bridge (mirrors xways-trufflehog): bulk_extractor is a
-//   per-item-COLLECT (selected-items mode) + BATCH-run tool. RunFlow's
-//   post-dialog body resolves the input, validates + identity-checks the BE
-//   binary, runs bulk_extractor once SYNCHRONOUSLY, then post-processes
-//   (add-evidence + feature-file tagging). Standalone runs that body inline
-//   after the modal dialog closes; managed mode runs the SAME sequence here in
-//   BulkExtractorOnFinalize with no dialog. We can't reuse RunFlow directly
-//   (it always pops the modal dialog and must stay byte-for-byte unchanged), so
-//   this is an additive re-statement of RunFlow's post-dialog steps that
-//   delegates to RunFlow's own leaf helpers. Every analyst-facing MessageBox in
-//   RunFlow becomes a Log() here (the manager forbids nested modals).
-//
-//   Why OnFinalize runs the scan (not OnPrepare): selected-items mode needs the
-//   full filter-respected item set, complete only after the last
-//   OnProcessItem fires — i.e. at finalize. The active-EO / pick-path modes
-//   don't need the item list, but routing every managed run through finalize
-//   keeps one code path. (Same reasoning as trufflehog.)
-
-#include "manager-plugin.h"
-
-#include <cstdarg>
-
-// printf-style wide formatter for the managed-mode log lines (bulk_extractor's
-// standalone code uses fixed swprintf_s buffers inline; this keeps the managed
-// block terse without touching the existing helpers).
-static std::wstring FormatStr(const wchar_t* fmt, ...) {
-    wchar_t buf[1024];
-    va_list ap; va_start(ap, fmt);
-    _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
-    va_end(ap);
-    return buf;
-}
-
-// Item-collection state for managed mode (mirror of the standalone g_run, but
-// the manager owns the abort/message plumbing so we only accumulate IDs).
-struct ManagedCollected {
-    bool              ready     = false;
-    HANDLE            hVolume   = nullptr;
-    HANDLE            hEvidence = nullptr;
-    bool              selectionMode = false;
-    std::vector<LONG> selected;
-};
-static ManagedCollected g_managed_collected;
-
-// Prime g_managed_settings with the same context-independent defaults RunFlow
-// computes before showing the dialog (cfg overrides, bundled BE binary, WSL
-// detection, output-dir suggestion, thread count, scanner defaults). The
-// EO-source probe is volume-dependent, so it is deferred to OnPrepare/OnFinalize
-// — the embedded tab lets the analyst choose the input mode regardless.
-static void PrimeManagedSettings() {
-    Settings& s = g_managed_settings;
-    std::wstring selfDir = GetSelfDirectory();
-    CfgValues cfg = LoadCfg(selfDir);
-
-    if (!cfg.be_binary.empty()) {
-        s.beBinary = cfg.be_binary;
-    } else {
-        std::wstring bundled = selfDir + L"\\bulk_extractor64.exe";
-        if (FileExists(bundled)) s.beBinary = bundled;
-    }
-
-    if (!cfg.wsl_be_binary.empty()) {
-        s.wslBeBinary = cfg.wsl_be_binary;
-    } else {
-        const WslInfo& wsl = DetectWslOnce();
-        if (wsl.be_available) s.wslBeBinary = wsl.be_path;
-    }
-    {
-        const WslInfo& wsl = DetectWslOnce();
-        s.useWsl = cfg.use_wsl_default && wsl.wsl_present && wsl.be_available;
-    }
-
-    s.outputDir   = !cfg.default_output_dir.empty() ? cfg.default_output_dir
-                                                    : SuggestOutputDir();
-    s.keepTempDir = cfg.keep_temp_dir;
-
-    SYSTEM_INFO sysinfo = {}; GetSystemInfo(&sysinfo);
-    s.threadsMax = (int)sysinfo.dwNumberOfProcessors;
-    if (s.threadsMax < 1) s.threadsMax = 1;
-    s.threads = (s.threadsMax + 1) / 2;
-
-    s.scannerOn.assign(kNumScanners, false);
-    for (int i = 0; i < kNumScanners; ++i) s.scannerOn[i] = kScanners[i].defaultEnabled;
-
-    // Default input mode for the embedded tab: pick-path (the analyst can switch
-    // to selected-items / active-EO in the tab). selectionMode/hasActiveEoImage
-    // are refreshed per-run in OnPrepare from the actual invocation context.
-    if (s.inputMode != InputMode::SelectedItems &&
-        s.inputMode != InputMode::ActiveEoImage)
-        s.inputMode = InputMode::PickPath;
-}
-
-static bool __stdcall BulkExtractorOnInit(HMODULE, HWND hMainWnd, void*) {
-    g_hMainWnd = hMainWnd;
-
-    int missing = RetrieveFunctionPointers();
-    wchar_t buf[200];
-    swprintf_s(buf, L"%s %s — managed mode via xways-xt-manager, %d missing exports",
-               NAME, VERSION, missing);
-    Log(buf);
-    if (!XWF_OutputMessage) return false;  // bare minimum to be useful
-
-    g_managed_mode = true;
-    PrimeManagedSettings();
-    return true;
-}
-
-// Read the embedded dialog's control state back into g_managed_settings. Mirror
-// of the standalone IDOK reader (minus the Ctrl-save / EndDialog / output-dir
-// MessageBox gate — the manager forbids nested modals and keeps the dialog
-// alive across runs).
-static void __stdcall BulkExtractorHarvestSettings(HWND hDlg, void*) {
-    if (!hDlg) return;
-    Settings& s = g_managed_settings;
-
-    if      (IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_EVOIMAGE)) s.inputMode = InputMode::ActiveEoImage;
-    else if (IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_SELECTED)) s.inputMode = InputMode::SelectedItems;
-    else                                                          s.inputMode = InputMode::PickPath;
-
-    DlgGetText(hDlg, IDC_EDIT_INPUT_PATH, s.inputPath);
-    DlgGetText(hDlg, IDC_EDIT_OUTPUT_DIR, s.outputDir);
-
-    s.useWsl = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
-    {
-        std::wstring beField;
-        DlgGetText(hDlg, IDC_EDIT_BE_BIN, beField);
-        if (s.useWsl) s.wslBeBinary = beField;
-        else          s.beBinary    = beField;
-    }
-    {
-        HWND cb = GetDlgItem(hDlg, IDC_COMBO_THREADS);
-        int sel = (int)SendMessageW(cb, CB_GETCURSEL, 0, 0);
-        s.threads = (sel >= 0) ? (sel + 1) : 0;
-    }
-    s.maxRecurse = DlgGetInt(hDlg, IDC_EDIT_MAXRECURSE, 12);
-    s.scannerOn.assign(kNumScanners, false);
-    for (int i = 0; i < kNumScanners; ++i)
-        s.scannerOn[i] = IsDlgButtonChecked(hDlg, IDC_SCANNER_BASE + i) == BST_CHECKED;
-    s.addToCase         = IsDlgButtonChecked(hDlg, IDC_CHK_ADD_TO_CASE) == BST_CHECKED;
-    s.openFolder        = IsDlgButtonChecked(hDlg, IDC_CHK_OPEN_FOLDER) == BST_CHECKED;
-    s.tagScanned        = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_SCANNED) == BST_CHECKED;
-    s.tagHits           = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_HITS)    == BST_CHECKED;
-    s.tagHitsPerFeature = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_HITS_PER_FEATURE) == BST_CHECKED;
-
-    // Persist to the sidecar so the next session inherits the analyst's
-    // cfg-backed choices, matching the standalone Ctrl+Run save. Only the
-    // cfg-recognised keys round-trip (CollectCfgFromDialog filters to those).
-    CfgValues cfg = CollectCfgFromDialog(hDlg, &s);
-    std::wstring cfgPath = GetSelfDirectory() + L"\\bulk_extractor.cfg";
-    if (!SaveCfg(cfgPath, cfg))
-        Log(L"warning: could not save cfg from managed harvest to " + cfgPath);
-}
-
-static bool __stdcall BulkExtractorOnPrepare(HANDLE hVolume, HANDLE hEvidence,
-                                             DWORD nOpType, void*) {
-    // Stash handles + reset the collector. Return true so the manager fans out
-    // per-item callbacks; the scan runs in BulkExtractorOnFinalize once the
-    // selected-item set is complete.
-    g_managed_collected = ManagedCollected{};
-    g_managed_collected.ready         = true;
-    g_managed_collected.hVolume       = hVolume;
-    g_managed_collected.hEvidence     = hEvidence;
-    g_managed_collected.selectionMode = (nOpType == XT_ACTION_DBC);
-    Log(FormatStr(L"managed OnPrepare op=%lu", (unsigned long)nOpType));
-    return true;
-}
-
-static LONG __stdcall BulkExtractorOnProcessItem(LONG nItemID, HANDLE, void*) {
-    // Mirror standalone XT_ProcessItem's selected-items collection.
-    if (g_managed_collected.ready && g_managed_collected.selectionMode)
-        g_managed_collected.selected.push_back(nItemID);
-    return 0;
-}
-
-static bool __stdcall BulkExtractorOnFinalize(HANDLE hVolume, HANDLE hEvidence,
-                                              DWORD /*nOpType*/, void*) {
-    if (!g_managed_collected.ready) return true;
-
-    // ---- Build the run Settings from the harvested managed state.
-    Settings s = g_managed_settings;
-    s.selectionMode = g_managed_collected.selectionMode;
-    s.selectedCount = (int)g_managed_collected.selected.size();
-
-    // Honor the harvested input mode, but if the manager fanned out a DBC
-    // selection, force selected-items mode (matches XT_Prepare's DBC branch).
-    if (g_managed_collected.selectionMode) s.inputMode = InputMode::SelectedItems;
-
-    // Build the RunCtx for the shared body. Preserve the param-wins-over-
-    // collected precedence the managed path has always used (param handle wins
-    // when X-Ways supplies one at Finalize; else fall back to what OnPrepare
-    // stashed). Mirror it for BOTH hVolume and hEvidence.
-    RunCtx mctx;
-    mctx.hVolume       = hVolume   ? hVolume   : g_managed_collected.hVolume;
-    mctx.hEvidence     = hEvidence ? hEvidence : g_managed_collected.hEvidence;
-    mctx.selectionMode = g_managed_collected.selectionMode;
-    mctx.selected      = g_managed_collected.selected;
-
-    // ActiveEoImage: resolve the active EO's on-disk source path now (volume-
-    // dependent — can't be primed at OnInit) and stash into s.inputPath so the
-    // shared body resolves it identically to the standalone path. Same two-stage
-    // probe RunFlow uses, condensed (single-stage here, matching the prior
-    // managed code). If unresolvable, bail with a Log() (no modal in managed).
-    if (s.inputMode == InputMode::ActiveEoImage) {
-        std::wstring activeSrc;
-        if (XWF_GetProp && mctx.hVolume) {
-            INT64 rv8 = XWF_GetProp(mctx.hVolume, 8, nullptr);
-            wchar_t snap[1024] = {0};
-            if (SafeWcsCopyFromPtr(rv8, snap, 1024) > 0) {
-                std::wstring raw = TrimW(snap);
-                size_t lp = raw.find(L'[');
-                if (lp != std::wstring::npos) {
-                    size_t rp = raw.find(L']', lp + 1);
-                    raw = (rp == std::wstring::npos) ? raw.substr(lp + 1)
-                                                     : raw.substr(lp + 1, rp - lp - 1);
-                } else if (!raw.empty() && raw.back() == L']') raw.pop_back();
-                raw = TrimW(raw);
-                if (!raw.empty() && (FileExists(raw) || DirExists(raw))) activeSrc = raw;
-            }
-        }
-        if (activeSrc.empty()) {
-            Log(L"managed run: active-EO mode needs an on-disk source path but "
-                L"none was resolvable on this evidence object. Use pick-path or "
-                L"selected-items mode instead.");
-            g_managed_collected = ManagedCollected{};
-            return false;
-        }
-        s.inputPath = activeSrc;
-    }
-
-    // Managed/headless run shares the single RunWorkerEntry body (synchronous,
-    // no thread, pumpMessages=true — the manager owns the UI thread and forbids
-    // nested modals; no in-DLL Cancel here per design §3.4). g_dlgHwnd is null
-    // on this path so PostWorkerStatus/PostWorkerDone (added Phase 2) no-op.
-    bool didMutate = false;
-    RunWorkerEntry(mctx, s, /*pumpMessages=*/true, &didMutate);
-    (void)didMutate;  // managed mode: snapshot-save persistence is the manager's call.
-
-    g_managed_collected = ManagedCollected{};
-    return true;
-}
-
-extern "C" __declspec(dllexport)
-const XwaysManagerPluginDescriptor* __stdcall XwaysManagerPluginEntry(void) {
-    static const XwaysManagerPluginDescriptor desc = {
-        XWAYS_MANAGER_PLUGIN_ABI_VERSION,
-        sizeof(XwaysManagerPluginDescriptor),
-
-        L"xways-bulk_extractor",
-        L"bulk_extractor",
-        L"Run bulk_extractor over an image, path, or selected items + ingest "
-        L"feature-file hits as Report Table tags.",
-        VERSION,
-
-        IDD_SETTINGS,   // tab_dialog_resource_id (Option A — manager retrofits styles)
-        0,              // tab_dialog_embedded_resource_id (0 = use Option A path)
-        SettingsDlgProc,
-
-        BulkExtractorOnInit,
-        BulkExtractorOnPrepare,
-        BulkExtractorOnProcessItem, // on_process_item: collect selected item IDs
-                                    // (matches standalone XT_ProcessItem)
-        nullptr,                    // on_process_item_ex: not used (no per-item handle needed)
-        BulkExtractorOnFinalize,    // batch run happens here
-
-        true,           // default_enabled
-        nullptr,        // reserved
-
-        // -------- Post-v1 additive fields --------
-        BulkExtractorHarvestSettings
-    };
-    return &desc;
 }

@@ -6,4 +6,3 @@ EXPORTS
     XT_ProcessItem
     XT_Finalize
     XT_Done
-    XwaysManagerPluginEntry
