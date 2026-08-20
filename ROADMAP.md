@@ -97,8 +97,12 @@ BE's forensic-path output can be resolved back to snapshot items (e.g. via
 
 ### P2 — Pre-flight empty-output-dir check
 
-Detect a non-empty/own-prior-run output dir in the dialog before launch and
-prompt to pick a new one (or clear it). The stakes changed with BE 2.2.0:
+**Partially addressed in v0.5.0-beta** (2026-08-19, after observing the trap
+live): Run now re-stamps a previously-used *auto-suggested* dir so every Run
+gets a fresh timestamped dir. What remains of this item is the analyst-typed
+custom path: detect a non-empty dir there before launch and prompt to pick a
+new one (or clear it, e.g. via BE 2.2.0's `-Z`). The stakes changed with BE
+2.2.0:
 older BE refused a non-empty dir with a loud console error, but 2.2.0's
 restart logic **silently no-ops** when pointed at a completed run's dir
 (exit 0, nothing processed) — an analyst reusing a dir gets stale results

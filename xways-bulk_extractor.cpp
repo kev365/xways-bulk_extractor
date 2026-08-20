@@ -892,6 +892,45 @@ static std::wstring SuggestOutputDir() {
     return base + kProjectOutputSubdir + L"\\" + stamp;
 }
 
+// v0.5.0: re-stamp a reused auto-suggested output dir at Run time. The
+// suggestion above is timestamped once when the dialog opens, so a second Run
+// in the same dialog session would reuse the first run's dir — which
+// pre-2.2.0 BE refuses loudly and BE 2.2.0 silently no-ops on (its restart
+// logic sees the completed report.xml, exits 0, and processes nothing;
+// observed live 2026-08-19). Only leaves matching our exact
+// "bulk_extractor_<YYYYMMDD>_<HHMMSS>" suggestion pattern are touched, and
+// only when the dir already exists — an analyst-typed custom path is never
+// rewritten. Returns true if `dir` was replaced with a fresh sibling.
+static bool RestampSuggestedOutputDir(std::wstring& dir) {
+    static const wchar_t kLeafPrefix[]  = L"bulk_extractor_";
+    static constexpr size_t kPrefixLen  = 15;              // wcslen(kLeafPrefix)
+    static constexpr size_t kLeafLen    = kPrefixLen + 8 + 1 + 6;
+    const std::wstring trimmed = TrimW(dir);
+    size_t slash = trimmed.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return false;
+    const std::wstring leaf = trimmed.substr(slash + 1);
+    if (leaf.size() != kLeafLen) return false;
+    if (_wcsnicmp(leaf.c_str(), kLeafPrefix, kPrefixLen) != 0) return false;
+    for (size_t i = kPrefixLen; i < kLeafLen; ++i) {
+        if (i == kPrefixLen + 8) { if (leaf[i] != L'_') return false; }
+        else if (!iswdigit(leaf[i]))                    return false;
+    }
+    if (!DirExists(trimmed)) return false;  // unused suggestion — keep it
+    SYSTEMTIME st; GetSystemTime(&st);
+    wchar_t stamp[64];
+    swprintf_s(stamp, L"bulk_extractor_%04u%02u%02u_%02u%02u%02u",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::wstring fresh = trimmed.substr(0, slash + 1) + stamp;
+    // Same-second collision guard (Run clicked twice within one second, or a
+    // leftover dir): append _2.._9 until the name is unused.
+    for (int n = 2; DirExists(fresh) && n <= 9; ++n) {
+        fresh = trimmed.substr(0, slash + 1) + stamp + L"_" + std::to_wstring(n);
+    }
+    if (DirExists(fresh) || fresh == trimmed) return false;
+    dir = fresh;
+    return true;
+}
+
 // =============================================================================
 //  Settings + dialog
 // =============================================================================
@@ -1763,6 +1802,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
 
             DlgGetText(hDlg, IDC_EDIT_INPUT_PATH, s->inputPath);
             DlgGetText(hDlg, IDC_EDIT_OUTPUT_DIR, s->outputDir);
+            // v0.5.0: if the field still holds an auto-suggested dir that a
+            // previous Run already used, re-stamp it so every Run gets a
+            // fresh dir (see RestampSuggestedOutputDir for why reuse is bad).
+            if (RestampSuggestedOutputDir(s->outputDir)) {
+                SetDlgItemTextW(hDlg, IDC_EDIT_OUTPUT_DIR, s->outputDir.c_str());
+                Log(L"output dir already used by a previous run — re-stamped to: "
+                    + s->outputDir);
+            }
             // BE binary edit holds Linux path in WSL mode, Windows path
             // otherwise — capture into the matching Settings slot.
             s->useWsl = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
