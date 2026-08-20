@@ -45,6 +45,11 @@
 #define IDC_SCANNER_BASE            5000
 #define IDC_SCANNER_LAST            5099
 
+// v0.5.0: bottom bar — About + Open output live left of the status text on
+// the Run/Cancel row.
+#define IDC_BTN_ABOUT               160
+#define IDC_BTN_OPEN_OUTPUT         161
+
 // Output handling
 #define IDC_GROUP_OUTPUT            150
 #define IDC_CHK_ADD_TO_CASE         151

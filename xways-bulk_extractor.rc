@@ -67,9 +67,8 @@ BEGIN
     LTEXT           "",                                                 IDC_STATIC_WSL_VERSION,   275, 130, 114,   8
     EDITTEXT                                                            IDC_EDIT_BE_BIN,            7, 140, 332,  12, ES_AUTOHSCROLL
     PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_BE,        342, 139,  47,  14
-    // v0.4.0: helper-identity verification status (blank unless rejected).
-    // Sits in the 12-DLU gap between the BE-binary edit and the Scanners group.
-    LTEXT           "",                                                 IDC_STATIC_BE_STATUS,       7, 154, 386,   9
+    // v0.5.0: the status/progress line (IDC_STATIC_BE_STATUS) moved from the
+    // gap below this edit to the bottom bar, inline with Run/Cancel.
 
     // -------- Scanners group + Reset/Toggle to the RIGHT --------
     // y=166 (was 194) — shifted up by 28 with the rest of the lower stack.
@@ -99,11 +98,18 @@ BEGIN
     LTEXT           "Max recursion:",                                   IDC_LABEL_MAXRECURSE,     297, 428,  55,   8
     EDITTEXT                                                            IDC_EDIT_MAXRECURSE,      355, 426,  38,  12, ES_AUTOHSCROLL | ES_NUMBER
 
-    // -------- Run / Cancel --------
-    // v0.4.0: both owner-draw so the Ctrl-to-save gesture can tint Run blue
-    // ("Save") and swap Cancel's label to "Save as...". DM_SETDEFID (set in
-    // WM_INITDIALOG) keeps Enter triggering Run without DEFPUSHBUTTON, which
-    // conflicts with BS_OWNERDRAW.
+    // -------- Bottom bar: About / Open output | status | Run / Cancel -----
+    // v0.5.0: About + Open output on the left; the status/progress +
+    // helper-rejection line (previously under the BE-binary edit) sits
+    // between them and Run/Cancel so run feedback lives next to the action
+    // buttons. All five are in the cpp's kShiftIds (below the scanner group).
+    // v0.4.0: Run/Cancel owner-draw so the Ctrl-to-save gesture can tint Run
+    // blue ("Save") and swap Cancel's label to "Save as...". DM_SETDEFID (set
+    // in WM_INITDIALOG) keeps Enter triggering Run without DEFPUSHBUTTON,
+    // which conflicts with BS_OWNERDRAW.
+    PUSHBUTTON      "About",                                            IDC_BTN_ABOUT,              7, 448,  45,  14
+    PUSHBUTTON      "Open output",                                      IDC_BTN_OPEN_OUTPUT,       56, 448,  60,  14
+    LTEXT           "",                                                 IDC_STATIC_BE_STATUS,     122, 451, 157,   9
     PUSHBUTTON      "Run",                                              IDOK,                     283, 448,  50,  14, BS_OWNERDRAW
     PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 448,  50,  14, BS_OWNERDRAW
 END

@@ -1200,6 +1200,43 @@ static const int kRunLockIds[] = {
 // worker lambda inside StartBeWorker calls ExecuteBeRun).
 static void StartBeWorker(HWND hDlg);
 
+// Forward declaration — defined with the post-processing helpers below; the
+// dialog's Open-output button uses it too.
+static void OpenInExplorer(const std::wstring& path);
+
+// v0.5.0: the blue readout next to the WSL checkbox is mode-aware — it
+// describes the binary a Run would actually use. Native mode probes the
+// exe's `--version` banner (cached per path — the probe spawns a process);
+// WSL mode shows the one-time WSL detection status, as before.
+static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& nativePath) {
+    wchar_t verBuf[160] = {0};
+    bool wslMode = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
+    if (wslMode) {
+        const WslInfo& wsl = DetectWslOnce();
+        if      (!wsl.wsl_present)   wcscpy_s(verBuf, L"WSL not detected on this system");
+        else if (!wsl.be_available)  wcscpy_s(verBuf, L"bulk_extractor not found in WSL");
+        else if (!wsl.be_version.empty())
+            swprintf_s(verBuf, L"WSL bulk_extractor v%s detected", wsl.be_version.c_str());
+        else                         wcscpy_s(verBuf, L"WSL bulk_extractor detected");
+    } else {
+        std::wstring path = TrimW(nativePath);
+        if (path.empty() || !FileExists(path)) {
+            wcscpy_s(verBuf, L"no Windows bulk_extractor selected");
+        } else {
+            static std::wstring s_cachePath, s_cacheBanner;
+            if (path != s_cachePath) {
+                s_cachePath   = path;
+                s_cacheBanner = DetectHelperVersionFromFlag(path);
+            }
+            if (!s_cacheBanner.empty())
+                swprintf_s(verBuf, L"%s detected", s_cacheBanner.c_str());
+            else
+                wcscpy_s(verBuf, L"Windows binary selected (version unknown)");
+        }
+    }
+    SetDlgItemTextW(hDlg, IDC_STATIC_WSL_VERSION, verBuf);
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     static Settings* s = nullptr;
     switch (msg) {
@@ -1314,18 +1351,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             const WslInfo& wsl = DetectWslOnce();
             BOOL canUseWsl = wsl.wsl_present && wsl.be_available;
             EnableWindow(GetDlgItem(hDlg, IDC_CHK_USE_WSL), canUseWsl);
-            wchar_t verBuf[160] = {0};
-            if (!wsl.wsl_present) {
-                wcscpy_s(verBuf, L"WSL not detected on this system");
-            } else if (!wsl.be_available) {
-                wcscpy_s(verBuf, L"bulk_extractor not found in WSL");
-            } else if (!wsl.be_version.empty()) {
-                swprintf_s(verBuf, L"WSL bulk_extractor v%s detected",
-                           wsl.be_version.c_str());
-            } else {
-                wcscpy_s(verBuf, L"WSL bulk_extractor detected");
-            }
-            SetDlgItemTextW(hDlg, IDC_STATIC_WSL_VERSION, verBuf);
             // If WSL isn't usable, defensively unset the useWsl flag so
             // the BE-binary edit doesn't show the (now-meaningless) Linux
             // path.
@@ -1333,6 +1358,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 CheckDlgButton(hDlg, IDC_CHK_USE_WSL, BST_UNCHECKED);
                 SetDlgItemTextW(hDlg, IDC_EDIT_BE_BIN, s->beBinary.c_str());
             }
+            // v0.5.0: readout follows the mode actually in effect (after the
+            // defensive unset) — native shows the Windows binary's version.
+            UpdateBinaryStatusReadout(hDlg, s->beBinary);
         }
 
         // EO-unavailable hint next to the disabled radio.
@@ -1496,6 +1524,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                     IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
                     IDC_LABEL_THREADS,    IDC_COMBO_THREADS,
                     IDC_LABEL_MAXRECURSE, IDC_EDIT_MAXRECURSE,
+                    // v0.5.0 bottom bar: About / Open output / status line
+                    // moved down here with Run/Cancel.
+                    IDC_BTN_ABOUT, IDC_BTN_OPEN_OUTPUT, IDC_STATIC_BE_STATUS,
                     IDOK, IDCANCEL,
                 };
                 for (int id : kShiftIds) {
@@ -1731,6 +1762,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 ClearHelperRejection(hDlg);
                 Log(L"bulk_extractor binary accepted (" + p + L") — " + idDetail);
             }
+            UpdateBinaryStatusReadout(hDlg, p);
             return TRUE;
         }
         case IDC_CHK_USE_WSL: {
@@ -1763,6 +1795,30 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                         ShowHelperRejection(hDlg, nativePath, idDetail);
                 }
             }
+            // v0.5.0: readout swaps with the mode (WSL status vs native version).
+            UpdateBinaryStatusReadout(hDlg, s->beBinary);
+            return TRUE;
+        }
+        case IDC_BTN_ABOUT: {
+            std::wstring msg = std::wstring(NAME) + L" " + VERSION + L"\n\n" + DESCRIPTION;
+            MessageBoxW(hDlg, msg.c_str(), L"About", MB_OK | MB_ICONINFORMATION);
+            return TRUE;
+        }
+        case IDC_BTN_OPEN_OUTPUT: {
+            // Open the output dir if it exists; fall back to its parent (the
+            // per-X-Tension case folder) so the button is useful before the
+            // first run and after a re-stamp.
+            std::wstring p;
+            DlgGetText(hDlg, IDC_EDIT_OUTPUT_DIR, p);
+            p = TrimW(p);
+            if (!p.empty() && DirExists(p)) { OpenInExplorer(p); return TRUE; }
+            size_t slash = p.find_last_of(L'\\');
+            if (slash != std::wstring::npos && slash > 0) {
+                std::wstring parent = p.substr(0, slash);
+                if (DirExists(parent)) { OpenInExplorer(parent); return TRUE; }
+            }
+            MessageBoxW(hDlg, L"Output directory does not exist yet.",
+                        L"bulk_extractor", MB_OK | MB_ICONINFORMATION);
             return TRUE;
         }
         case IDC_BTN_RESET_SCANNERS: {
