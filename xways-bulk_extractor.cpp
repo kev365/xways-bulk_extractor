@@ -376,6 +376,17 @@ static std::wstring TrimW(const std::wstring& s) {
     return s.substr(lo, hi - lo);
 }
 
+// X-Ways hands back some paths in Win32 extended form ("\\?\C:\..." /
+// "\\?\UNC\server\share\...") — observed from XWF_GetCaseProp(6, case dir)
+// and XWF_GetProp(vol, 8, EO file-path) on a CLI-created case (2026-08-19,
+// 21.8 SR-5). Functional, but ugly in the dialog fields and unnecessary
+// below MAX_PATH — strip the prefix from paths we display or build on.
+static std::wstring StripExtendedPathPrefix(std::wstring s) {
+    if (s.rfind(L"\\\\?\\UNC\\", 0) == 0)  return L"\\\\" + s.substr(8);
+    if (s.rfind(L"\\\\?\\", 0) == 0)       return s.substr(4);
+    return s;
+}
+
 // Convert UTF-8 to wide.
 static std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) return {};
@@ -876,7 +887,8 @@ static std::wstring SuggestOutputDir() {
     if (XWF_GetCaseProp) {
         XWF_GetCaseProp(nullptr, 6, caseDir, MAX_PATH * 2);
     }
-    std::wstring base = caseDir[0] ? std::wstring(caseDir) : std::wstring();
+    std::wstring base = caseDir[0] ? StripExtendedPathPrefix(std::wstring(caseDir))
+                                   : std::wstring();
     if (base.empty()) {
         wchar_t tmp[MAX_PATH] = {0};
         DWORD n = GetTempPathW(MAX_PATH, tmp);
@@ -3075,7 +3087,7 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
         if (!vol || !XWF_GetProp) return {};
         INT64 rv8 = XWF_GetProp(vol, 8, nullptr);
         std::wstring raw = safeDerefWcs(rv8);
-        std::wstring stripped = stripBrackets(raw);
+        std::wstring stripped = StripExtendedPathPrefix(stripBrackets(raw));
 
         Log(std::wstring(L"  ") + label + L" GetProp(vol, 8 file-path) raw: " +
             (raw.empty() ? std::wstring(L"<empty>") : raw));
