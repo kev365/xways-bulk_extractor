@@ -104,7 +104,13 @@ enum : DWORD {
     XT_ACTION_SHC = 5,
 };
 
-// --- bulk_extractor scanners (default state matches BE 2.0.x defaults) -----
+// --- bulk_extractor scanners (defaults verified against BE 2.2.0 `-h`) -----
+//   List + default states re-verified 2026-08-19 against the official 2.2.0
+//   Windows binary: all pre-2.2.0 entries unchanged; 2.2.0 added `rtti` and
+//   `vin` (both enabled by default upstream). Caveat: BE hard-errors on -e/-x
+//   with a name it doesn't know ("no such scanner", exit 5, verified), so
+//   UNchecking a 2.2.0-only scanner while running a pre-2.2.0 BE fails the
+//   run — loudly and self-explanatorily, hence no version-gating here.
 //   Order = the order they appear in the dialog (3 columns x ceil(N/3) rows).
 //   defaultEnabled flag drives both initial dialog state and the -e/-x logic
 //   in RunBulkExtractor (we only emit a flag when the user diverges from the
@@ -147,9 +153,11 @@ static const ScannerInfo kScanners[] = {
     {L"outlook",       false},
     {L"pdf",           true },
     {L"rar",           true },
+    {L"rtti",          true },   // BE 2.2.0+: RawTherapee 8-bit thumbnail carver
     {L"sqlite",        true },
     {L"utmp",          true },
     {L"vcard_carved",  true },
+    {L"vin",           true },   // BE 2.2.0+: Vehicle Identification Numbers
     {L"windirs",       true },
     {L"winlnk",        true },
     {L"winpe",         true },
@@ -472,8 +480,9 @@ static std::string WideToUtf8(const std::wstring& w) {
 //   LoadCfg reads — EXCEPT default_output_dir: per the project output-dir
 //   convention the run output is auto-suggested per-run as
 //   <caseRoot>\xways-bulk_extractor\bulk_extractor_<stamp>, so pinning a single
-//   dir in cfg would defeat the timestamped-subdir scheme (and BE refuses to
-//   reuse a non-empty output dir anyway). The dialog's scanner toggles /
+//   dir in cfg would defeat the timestamped-subdir scheme (and BE mishandles a
+//   reused output dir: pre-2.2.0 refuses loudly; 2.2.0's restart logic exits 0
+//   having silently processed nothing). The dialog's scanner toggles /
 //   threads / tagging are NOT cfg-backed in LoadCfg, so they're intentionally
 //   left out to keep this a faithful round-trip of the existing cfg surface.
 //
@@ -856,8 +865,9 @@ static std::wstring CreateUniqueTempDir(HANDLE hEvidence, const wchar_t* suffix)
 //   Project convention: analyst-facing output goes under
 //   <caseRoot>\xways-bulk_extractor\ so reports stay grouped per X-Tension
 //   instead of piling at the case root. bulk_extractor itself needs a fresh
-//   subdir per run (it refuses to overwrite an existing output dir), so we
-//   nest a timestamped "bulk_extractor_<stamp>" inside the project folder.
+//   subdir per run (pre-2.2.0 refuses an existing output dir; 2.2.0 treats it
+//   as a completed restart and silently does nothing), so we nest a
+//   timestamped "bulk_extractor_<stamp>" inside the project folder.
 //   See "Output convention" in CLAUDE.md.
 static const wchar_t* kProjectOutputSubdir = L"xways-bulk_extractor";
 
@@ -1970,8 +1980,10 @@ static bool ShowSettingsDialog(HWND parent, Settings& s) {
 //  WSL detection + path translation (v0.3.0)
 // =============================================================================
 //   Lets the analyst run BE via WSL ("Run via WSL" checkbox in the dialog)
-//   instead of the bundled Windows binary. Useful because BE 2.1.x doesn't
-//   build on Windows but installs cleanly on Linux distros via apt/dnf.
+//   instead of the bundled Windows binary. Historically necessary because BE
+//   2.1.x didn't build on Windows; since 2.2.0 (2026-08-18) upstream ships an
+//   official Windows binary with E01 support, so WSL is now optional — kept
+//   for analysts with distro-packaged or self-built BE setups.
 
 // Run a command line synchronously, capture stdout into `out`. Returns the
 // exit code; sets *pTimedOut=true on timeout. Used for WSL detection probes.
@@ -2091,7 +2103,8 @@ static const WslInfo& DetectWslOnce() {
 
     // Step 3: probe version. Output format depends on BE version:
     //   BE 2.0.x: "bulk_extractor version 2.0.4"
-    //   BE 2.1.x: "bulk_extractor 2.1.1"  (the word "version" was dropped)
+    //   BE 2.1.x+: "bulk_extractor 2.1.1"  (the word "version" was dropped;
+    //              same shape verified for 2.2.0: "bulk_extractor 2.2.0")
     // Strategy: try " version " first (legacy format), otherwise scan for
     // the first whitespace-delimited token that starts with a digit and
     // contains a '.' (the version number itself).
@@ -2366,9 +2379,11 @@ struct FeatureHits {
 // invented names that don't appear anywhere in the dialog.
 //
 // Source for the mapping: bulk_extractor 2.0.x documentation + reading
-// scanner_*.cpp files in upstream src/ tree. Feature file names that
-// aren't in this table fall through to the original feature name, so we
-// degrade gracefully if BE adds new feature outputs.
+// scanner_*.cpp files in upstream src/ tree; 2.2.0 additions verified via
+// `bulk_extractor64.exe -H` (each new scanner's "Feature Names" equals its
+// scanner name). Feature file names that aren't in this table fall through
+// to the original feature name, so we degrade gracefully if BE adds new
+// feature outputs.
 static std::wstring FeatureToScanner(const std::wstring& featureName) {
     static const struct { const wchar_t* feature; const wchar_t* scanner; } kMap[] = {
         // accts scanner — credit cards, SSNs, telephone numbers
@@ -2439,6 +2454,8 @@ static std::wstring FeatureToScanner(const std::wstring& featureName) {
         {L"pdf",                    L"pdf"},
         // rar scanner — RAR archive carving
         {L"rar",                    L"rar"},
+        // rtti scanner (BE 2.2.0+) — RawTherapee 8-bit thumbnail carving
+        {L"rtti",                   L"rtti"},
         // sqlite scanner — SQLite databases
         {L"sqlite_carved",          L"sqlite"},
         // utmp scanner — Unix login records
@@ -2446,6 +2463,8 @@ static std::wstring FeatureToScanner(const std::wstring& featureName) {
         // vcard_carved scanner
         {L"vcard",                  L"vcard_carved"},
         {L"vcard_carved",           L"vcard_carved"},
+        // vin scanner (BE 2.2.0+) — Vehicle Identification Numbers
+        {L"vin",                    L"vin"},
         // windirs scanner — Windows directory artefacts
         {L"windirs",                L"windirs"},
         {L"windows_directories",    L"windirs"},
@@ -2731,8 +2750,10 @@ static RunOutcome ExecuteBeRun(const Settings& s, const RunPrep& prep,
             return RunOutcome::PrereqFailed;
         }
     }
-    // BE refuses to run if the output dir already contains BE artifacts. We
-    // honor that — analyst should pick an empty / new dir. Just log it.
+    // A reused output dir is analyst error: pre-2.2.0 BE refuses to run if it
+    // already contains BE artifacts; 2.2.0's restart logic instead exits 0
+    // without processing anything (verified 2026-08-19). Either way the fix is
+    // the same — pick an empty / new dir. Just log what BE reports.
     Log(L"output dir: "    + s.outputDir);
     Log(L"input for BE: "  + inputForBE);
     if (s.useWsl) {

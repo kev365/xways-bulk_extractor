@@ -2,7 +2,17 @@
 
 Wraps Simson Garfinkel's [bulk_extractor](https://github.com/simsong/bulk_extractor) as an X-Ways Forensics X-Tension. Exposes a settings dialog (parented to X-Ways' main window), runs `bulk_extractor64.exe` (Windows) **or `bulk_extractor` via WSL** against the chosen input, and (optionally) feeds the output back into X-Ways.
 
-> **Status: 0.4.0-beta.** Functionally complete and exercised end-to-end on real cases, but still pre-1.0 — see [ROADMAP.md](ROADMAP.md) for what's planned before a stable release.
+> **Status: 0.5.0-beta.** Functionally complete and exercised end-to-end on real cases, but still pre-1.0 — see [ROADMAP.md](ROADMAP.md) for what's planned before a stable release.
+
+## v0.5.0-beta changes (2026-08-19 — in-DLL Cancel + BE 2.2.0)
+
+- **Real in-DLL Cancel.** The BE run moved off the UI thread onto a joinable worker with a three-phase split that keeps every `XWF_*` call on X-Ways' own thread: input prep runs in the Run handler, only the BE subprocess runs on the worker (cancellable — the Cancel button terminates the child within ~100 ms), and post-processing (evidence object, labels, temp cleanup) runs back on the UI thread when the worker reports done. The dialog stays responsive throughout; closing it mid-run is blocked, and Cancel shows a "Cancelling…" status until the child is reaped.
+- **bulk_extractor 2.2.0 support** (all findings verified against the official 2.2.0 Windows release binary, not just the release notes):
+  - Two new scanner checkboxes: **`vin`** (Vehicle Identification Numbers) and **`rtti`** (RawTherapee 8-bit thumbnail carver) — both enabled by default upstream, checklist now 37 scanners. Note: unchecking either while running a pre-2.2.0 BE fails the run (BE hard-errors on `-x` of a name it doesn't know: `no such scanner`).
+  - 2.2.0 is the **first upstream release with an official precompiled Windows binary** (`bulk_extractor64.exe`) — and it reads E01 images and raw devices natively, so WSL is no longer required for E01 or ≥2.1 features. The MinGW-built exe has an empty PE `VERSIONINFO`; the identity gate passes it via its `--version` banner check.
+  - `base16` was **not** removed (the release note about the "stale lightgrep base16 scanner" refers to internal code) and the new `--dedupe-mode` defaults to legacy behavior — both verified, no changes needed.
+  - **Output-dir caveat**: 2.2.0 no longer refuses a non-empty output dir; rerunning into a completed run's dir exits 0 having silently processed nothing (its restart logic sees the finished `report.xml`). Keep using a fresh dir per run — the suggested timestamped default already does this.
+- **X-Tension-manager compatibility layer removed** (that project is retired); the DLL now exports only the standard `XT_*` entry points, and carries a proper `VERSIONINFO` resource.
 
 ## v0.4.0-beta changes (2026-06-06)
 
@@ -25,7 +35,9 @@ Wraps Simson Garfinkel's [bulk_extractor](https://github.com/simsong/bulk_extrac
 
 The X-Tension auto-detects whatever BE the analyst has installed in WSL — nothing is bundled or pre-built.
 
-`bulk-extractor` is **not in current Ubuntu repos** (it was removed in 22.04+ and Debian 11+), so `apt install` won't work on a fresh WSL install. The reliable path is **build from source**, which is also how you get the current BE 2.1.x line. Recipe distilled from [upstream's install wiki](https://github.com/simsong/bulk_extractor/wiki/Installing-bulk_extractor):
+> **Note:** since BE 2.2.0 ships an official Windows binary with native E01 and raw-device support, WSL mode is optional — useful mainly if you prefer a distro-packaged or self-built BE.
+
+`bulk-extractor` is **not in current Ubuntu repos** (it was removed in 22.04+ and Debian 11+), so `apt install` won't work on a fresh WSL install. The reliable path is **build from source**. Recipe distilled from [upstream's install wiki](https://github.com/simsong/bulk_extractor/wiki/Installing-bulk_extractor):
 
 The recipe below installs:
 
@@ -97,13 +109,38 @@ If a previous build attempt left a partial clone, `rm -rf ~/bulk_extractor` and 
 
 The X-Tension uses `wsl.exe -e ...` which targets the analyst's **default** distro (set with `wsl --set-default <name>`). No distro-specific code in the X-Tension. Setup docs target Ubuntu since that's the default for fresh WSL installs.
 
+### BE 2.2.0 compatibility (verified 2026-08-19)
+
+Verified against the official v2.2.0 Windows release binary (SHA256-checked
+against the published `SHA256SUMS`), exercised directly rather than trusting
+the release notes:
+
+- **Scanner set**: all 35 pre-2.2.0 scanners unchanged (defaults included —
+  `base16` still exists, still default-off). Two additions, both default-on:
+  `vin` and `rtti`. `kScanners` and `FeatureToScanner` updated; per `-H`, each
+  new scanner's feature name equals its scanner name (`vin.txt` confirmed live
+  with test VINs), so hit labels come out as `bulk_extractor: vin` / `rtti`.
+- **Identity gate / version parse**: the MinGW-built exe ships an empty PE
+  `VERSIONINFO`, so verification passes via the `--version` banner
+  (`bulk_extractor 2.2.0`, same shape as 2.1.x — parser unchanged).
+- **E01 + raw devices, natively on Windows**: a test E01 was decompressed and
+  scanned at full logical size without WSL; the help text documents raw-device
+  inputs (`\\.\PhysicalDriveN`, `\\.\X:`, `\\?\Volume{GUID}`).
+- **Output-dir semantics changed**: instead of refusing a non-empty output
+  dir, 2.2.0's restart logic exits 0 and silently processes nothing when the
+  dir holds a completed run (existing feature files are left intact). Use a
+  fresh dir per run; the new `-Z` (zap) flag wipes the dir first if you truly
+  want to reuse one.
+- **`--dedupe-mode`** is new but defaults to `2` (legacy) — behavior matches
+  2.1.x unless overridden.
+
 ### BE 2.1.x compatibility (verified 2026-05-05)
 
 The Windows side ships BE 2.0.2 (bundled binary) and the WSL side runs whatever the analyst built — verified working against **BE 2.1.1** built from `master` on Ubuntu 24.04. End-to-end run (8 NTFS items including bootmgr, MFT, pagefile.sys) returned exit code 0, produced feature files, and surfaced 10 per-scanner labels across 18 tagged items.
 
 - **Cmdline flags** — `-o`, `-j`, `-M`, `-R`, `-e`, `-x` all behave the same as 2.0.x. No changes needed.
 - **New `*_carved` feature files in 2.1.x** — `ntfslogfile_carved`, `ntfsmft_carved`, `ntfsusn_carved`, `winpe_carved` appear alongside the parent recorders. These surface as `bulk_extractor: ntfslogfile_carved` etc. via the per-scanner-label code, which derives labels from feature filenames — no `FeatureToScanner` table change required.
-- **Scanner toggle list** — `kScanners` is built against 2.0.2's 35 scanners; 2.1.1 keeps the same set, so the checkbox grid covers it. New 2.1.x scanners (if any are added in future builds) would simply not appear as checkboxes — they'd run with their BE-side default and emit feature files normally; the only consequence is the analyst can't toggle them off via the dialog. Detect with: diff `bulk_extractor -h` against `kScanners` and append entries.
+- **Scanner toggle list** — `kScanners` was built against 2.0.2's 35 scanners; 2.1.1 keeps the same set, so the checkbox grid covers it. (2.2.0 added `vin` and `rtti` — both now in the checklist, see the 2.2.0 section above.) Scanners a future BE adds before the list is updated simply don't appear as checkboxes — they run with their BE-side default and emit feature files normally; the only consequence is the analyst can't toggle them from the dialog. Detect with: diff `bulk_extractor -h` against `kScanners` and append entries.
 
 If a feature filename appears that you want to *suppress* via the dialog (rather than just label after the fact), add it to `kScanners`. Otherwise it'll surface as a label transparently and there's nothing to do.
 
@@ -127,7 +164,7 @@ If a feature filename appears that you want to *suppress* via the dialog (rather
 - **bulk_extractor binary** — auto-filled with the bundled binary path; overridable here, or via `bulk_extractor.cfg` `be_binary=...`.
 - **Threads (-j)** — dropdown listing 1..N where N = system cores; default selected = max(1, N/2) so the analyst keeps headroom for X-Ways and the OS while BE is grinding.
 - **Max recursion (-M)** — defaults to 12 (BE's own default).
-- **Scanners** — one checkbox per BE scanner (35 total in 3 columns), pre-checked to match BE's defaults. Toggle any to override; "Reset to defaults" restores BE defaults. The X-Tension only emits `-e` / `-x` flags for scanners that diverge from defaults, so the cmdline stays readable in the messages-window log.
+- **Scanners** — one checkbox per BE scanner (37 total in 3 columns as of BE 2.2.0), pre-checked to match BE's defaults. Toggle any to override; "Reset to defaults" restores BE defaults. The X-Tension only emits `-e` / `-x` flags for scanners that diverge from defaults, so the cmdline stays readable in the messages-window log.
 - **Output handling** — four checkboxes:
   - Add output dir as evidence (default on).
   - Open in Explorer when done.
@@ -159,25 +196,26 @@ xtensions\                                  <- copied into <X-Ways install>\xten
     ├── xways-bulk_extractor.dll
     ├── xways-bulk_extractor.cfg            (optional sidecar overrides)
     ├── xways-bulk_extractor.cfg.example    (documents every cfg key)
-    └── bulk_extractor64.exe                (upstream v2.0.x binary, alongside the DLL)
+    └── bulk_extractor64.exe                (upstream binary, alongside the DLL — v2.2.0+ recommended)
 ```
 
 ### Sourcing `bulk_extractor64.exe`
 
-The 86 MB binary is **not committed to this repo** (`.gitignore`'d to keep the
-clone size sane); fresh checkouts need to download it once. As of 2026-05-02
-the only precompiled Windows binary in existence is the v2.0.0 release
-hosted on the Digital Corpora S3 bucket linked from the upstream README:
+The ~97 MB binary is **not committed to this repo** (`.gitignore`'d to keep the
+clone size sane); fresh checkouts need to download it once. Since **v2.2.0**
+(2026-08-18) upstream publishes an official precompiled Windows binary with
+each GitHub release — verify its SHA-256 against the release's `SHA256SUMS`:
 
 - Upstream project: <https://github.com/simsong/bulk_extractor>
-- Windows binary download: <http://digitalcorpora.s3.amazonaws.com/downloads/bulk_extractor/bulk_extractor-2.0.0-windows.zip>
-- Self-reported version after extracting: `v2.0.2` (binary header label,
-  despite the zip being labelled v2.0.0).
-- Expected install path: `x-tensions/xways-bulk_extractor/xtensions/xways-bulk_extractor/bulk_extractor64.exe` (alongside the built DLL).
+- Windows binary download: <https://github.com/simsong/bulk_extractor/releases/latest> (`bulk_extractor64.exe` asset)
+- Expected install path: `xtensions/xways-bulk_extractor/bulk_extractor64.exe` (alongside the built DLL).
 
-If a newer Windows build appears upstream, drop it in the same path and
-the X-Tension picks it up automatically (see priority chain below). To pin
-to an out-of-tree binary, use the dialog field or `be_binary=` in
+(Historical: before 2.2.0 the only precompiled Windows binary was a v2.0.2
+build hosted on the Digital Corpora S3 bucket — no longer recommended.)
+
+When a newer Windows build ships, drop it in the same path and the X-Tension
+picks it up automatically (see priority chain below). To pin to an
+out-of-tree binary, use the dialog field or `be_binary=` in
 `bulk_extractor.cfg`.
 
 The DLL resolves the BE binary via this priority chain (highest wins):
@@ -210,11 +248,14 @@ keep_temp_dir=false
 
 ## Bundled bulk_extractor version
 
-The bundled `bulk_extractor64.exe` is sourced from `digitalcorpora.s3.amazonaws.com/downloads/bulk_extractor/bulk_extractor-2.0.0-windows.zip` (the URL says 2.0.0, but the binary inside self-reports as **v2.0.2** — `bulk_extractor64.exe -V` confirms this). It's the only precompiled Windows binary in existence as of 2026-05-02. v2.0.6 (latest 2.0.x) and v2.1.x (latest line) ship source-only on GitHub; the upstream README explicitly notes 2.1 *"does not build on Windows"*. The bundled binary is statically linked (~86 MB, no DLL dependencies).
+The recommended `bulk_extractor64.exe` is the official **v2.2.0** release asset from GitHub — the first upstream release with a precompiled Windows binary (CI-built via MinGW cross-compile; statically linked, no DLL dependencies, empty PE `VERSIONINFO` so the identity gate uses its `--version` banner). It reads E01 images and raw devices natively.
 
 - File: `xtensions\xways-bulk_extractor\bulk_extractor64.exe`
-- Size: 90,072,666 bytes
-- SHA-256: `01364D33C0A0AF86DEAD0B56794E5A098BD10280174FD0D67537BAFEB500A4A0`
+- Source: <https://github.com/simsong/bulk_extractor/releases/tag/v2.2.0>
+- Size: 97,268,659 bytes
+- SHA-256: `DFCC678EE3B7DA111E8FBA6259C4E842FFFFCBE42DD96E6C6E6CC238D74BD911`
+
+(The previous recommendation was the v2.0.2 build from the Digital Corpora S3 bucket, 90,072,666 bytes, SHA-256 `01364D33C0A0AF86DEAD0B56794E5A098BD10280174FD0D67537BAFEB500A4A0` — still works with this X-Tension, but lacks E01/raw-device input and the `vin`/`rtti` scanners.)
 
 To upgrade later: drop a newer `bulk_extractor64.exe` over the bundled one, or point the cfg / dialog at a different path.
 

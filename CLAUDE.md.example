@@ -68,8 +68,13 @@ detach it, and never move an `XWF_*` call into phase B.
 
 ## Gotchas / notes
 
-- BE refuses to run into a non-empty output dir — the X-Tension suggests a
-  fresh per-run subdir and just logs BE's refusal otherwise.
+- A reused (non-empty) output dir is analyst error: pre-2.2.0 BE refuses to
+  run; BE 2.2.0's restart logic instead exits 0 having silently processed
+  nothing. The X-Tension suggests a fresh per-run subdir and just logs what
+  BE reports otherwise.
+- BE hard-errors on `-e`/`-x` with a scanner name it doesn't know (`no such
+  scanner`, exit 5) — so unchecking a 2.2.0-only scanner (`vin`, `rtti`)
+  against a pre-2.2.0 binary fails the run. Deliberate: no version-gating.
 - Selected-items mode needs a volume handle: invoked from the Case Root
   window, `hVolume` is NULL (21.4 SR-5 behavior) and the run is refused with
   an explanation.
