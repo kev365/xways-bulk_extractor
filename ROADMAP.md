@@ -37,25 +37,28 @@ not just the release notes — which turned out to be misleading in two places.
 
 **To do:**
 
-- [ ] Append the two **new scanners** to `kScanners`, both enabled by
+- [x] Append the two **new scanners** to `kScanners`, both enabled by
   default upstream: `vin` (Vehicle Identification Numbers, Kam A. Woods) and
   `rtti` (RawTherapee 8-bit thumbnail carver). Per `-H`, each scanner's
   feature name equals its scanner name (`vin.txt` verified live), so the
   `FeatureToScanner` fall-through already labels their hits correctly — add
   explicit map entries anyway and update the "calibrated against BE 2.0.2"
-  comments to 2.2.0.
-- [ ] **Output-dir semantics changed — update our guard.** 2.2.0 no longer
+  comments to 2.2.0. *(Done 2026-08-19. Deliberate non-feature: no
+  version-gating on the new checkboxes — BE hard-errors loudly on `-x` of an
+  unknown scanner name, verified `no such scanner` / exit 5.)*
+- [x] **Output-dir semantics changed — update our guard.** 2.2.0 no longer
   *refuses* a non-empty output dir: rerunning into a completed run's dir
   exits 0 and silently processes nothing (restart logic sees the finished
   `report.xml`; existing feature files are left intact). That silent no-op
   is easier to misread than the old loud error, so the pre-flight
   non-empty-dir check (below) gets more important, and the new **`-Z`
   (zap)** flag — wipe the output dir before starting — is the natural
-  opt-in remedy to offer.
-- [ ] README refresh: official Windows 2.2.0 download (WSL no longer needed
+  opt-in remedy to offer. *(Comments/README/docs updated 2026-08-19; the
+  pre-flight dialog check itself remains the P2 item below.)*
+- [x] README refresh: official Windows 2.2.0 download (WSL no longer needed
   for E01 or for running ≥2.1; the "BE 2.0.2 is the only precompiled
   Windows build" claim is obsolete), bundled-binary guidance, version
-  examples.
+  examples. *(Done 2026-08-19.)*
 - [ ] Consider exposing `--dedupe-mode` and `-Z` in the dialog/cfg
   (default-off; `-Z` needs a confirm — it recursively deletes).
 - [ ] Manual (X-Ways GUI) verification: identity gate should report
