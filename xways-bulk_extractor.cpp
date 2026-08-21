@@ -48,6 +48,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <commctrl.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -119,52 +120,53 @@ enum : DWORD {
 struct ScannerInfo {
     const wchar_t* name;
     bool           defaultEnabled;
+    const wchar_t* tip;   // tooltip — description per `bulk_extractor -H` (2.2.0)
 };
 
 static const ScannerInfo kScanners[] = {
-    {L"accts",         true },
-    {L"aes",           true },
-    {L"base16",        false},
-    {L"base64",        true },
-    {L"elf",           true },
-    {L"email",         true },
-    {L"evtx",          true },
-    {L"exif",          true },
-    {L"facebook",      true },
-    {L"find",          true },
-    {L"gps",           true },
-    {L"gzip",          true },
+    {L"accts",          true , L"Scans for credit card numbers, track-2 data, PII (SSN, Canadian SIN) and phone numbers"},
+    {L"aes",            true , L"Searches for AES key schedules (128/192/256-bit keys in memory or swap)"},
+    {L"base16",         false, L"Base16 (hex-encoded) data scanner"},
+    {L"base64",         true , L"Scans for Base64-encoded data and recurses into it"},
+    {L"elf",            true , L"Finds ELF (Linux/Unix executable) headers"},
+    {L"email",          true , L"Scans for email addresses, domains, URLs, RFC822 headers, etc."},
+    {L"evtx",           true , L"Scans for Windows EVTX chunks and carves valid EVTX files"},
+    {L"exif",           true , L"Searches for EXIF sections in JPEGs; also carves JPEG files (must be enabled for JPEG carving)"},
+    {L"facebook",       true , L"Searches for Facebook HTML and JSON tags"},
+    {L"find",           true , L"Simple search for user-supplied patterns (-f / -F)"},
+    {L"gps",            true , L"Garmin trackpoint XML / GPS coordinates"},
+    {L"gzip",           true , L"Searches for GZIP-compressed data and recurses into it"},
     // Note (v0.2.15): `hex` is NOT a BE scanner — verified against
     // `bulk_extractor64.exe -h` (BE 2.0.2). It's a feature-file output
     // channel that multiple scanners write hex-encoded content to. v0.2.14
     // mistakenly listed it as a scanner; reverted here. The
     // FeatureToScanner mapping still has an entry for "hex" so the label
     // stays meaningful when BE produces hex.txt.
-    {L"hiberfile",     false},
-    {L"httplogs",      true },
-    {L"json",          true },
-    {L"kml_carved",    true },
-    {L"msxml",         true },
-    {L"net",           true },
-    {L"ntfsindx",      true },
-    {L"ntfslogfile",   true },
-    {L"ntfsmft",       true },
-    {L"ntfsusn",       true },
-    {L"outlook",       false},
-    {L"pdf",           true },
-    {L"rar",           true },
-    {L"rtti",          true },   // BE 2.2.0+: RawTherapee 8-bit thumbnail carver
-    {L"sqlite",        true },
-    {L"utmp",          true },
-    {L"vcard_carved",  true },
-    {L"vin",           true },   // BE 2.2.0+: Vehicle Identification Numbers
-    {L"windirs",       true },
-    {L"winlnk",        true },
-    {L"winpe",         true },
-    {L"winprefetch",   true },
-    {L"wordlist",      false},
-    {L"xor",           false},
-    {L"zip",           true },
+    {L"hiberfile",      false, L"Scans for Microsoft XPress-compressed data (hiberfil.sys). Off by default"},
+    {L"httplogs",       true , L"Extracts web-server access-log fragments"},
+    {L"json",           true , L"Scans for JSON-encoded data"},
+    {L"kml_carved",     true , L"Scans for and carves KML (Google Earth) files"},
+    {L"msxml",          true , L"Extracts text from Microsoft Office XML files"},
+    {L"net",            true , L"Scans for IP packets: URLs, domains, IPs, MACs, TCP (also feeds url/domain/ip feature files)"},
+    {L"ntfsindx",       true , L"Scans for NTFS $INDEX_ALLOCATION (INDX) records"},
+    {L"ntfslogfile",    true , L"Scans for NTFS $LogFile RCRD records"},
+    {L"ntfsmft",        true , L"Scans for NTFS MFT records"},
+    {L"ntfsusn",        true , L"Scans for USN_RECORD v2/v4 change-journal records"},
+    {L"outlook",        false, L"Outlook compressible encryption. Very CPU intensive -- off by default"},
+    {L"pdf",            true , L"Extracts text from PDF files"},
+    {L"rar",            true , L"RAR volume locator and component decompresser"},
+    {L"rtti",           true , L"Carves 8-bit RawTherapee thumbnail images (BE 2.2.0+)"},   // BE 2.2.0+: RawTherapee 8-bit thumbnail carver
+    {L"sqlite",         true , L"Scans for and carves SQLite3 databases"},
+    {L"utmp",           true , L"Scans for utmp/wtmp login records"},
+    {L"vcard_carved",   true , L"Scans for and carves vCard data"},
+    {L"vin",            true , L"Scans for Vehicle Identification Numbers (BE 2.2.0+)"},   // BE 2.2.0+: Vehicle Identification Numbers
+    {L"windirs",        true , L"Scans Microsoft directory structures (FAT32 / exFAT entries)"},
+    {L"winlnk",         true , L"Searches for Windows LNK (shortcut) files"},
+    {L"winpe",          true , L"Scans for Windows PE (executable) headers"},
+    {L"winprefetch",    true , L"Searches for Windows Prefetch files"},
+    {L"wordlist",       false, L"Builds a word list from all text found (for password cracking). Off by default"},
+    {L"xor",            false, L"Optimistic XOR de-obfuscator. Off by default"},
+    {L"zip",            true , L"Scans for ZIP archives and components and recurses into them"},
 };
 static constexpr int kNumScanners = sizeof(kScanners) / sizeof(kScanners[0]);
 
@@ -385,6 +387,15 @@ static std::wstring StripExtendedPathPrefix(std::wstring s) {
     if (s.rfind(L"\\\\?\\UNC\\", 0) == 0)  return L"\\\\" + s.substr(8);
     if (s.rfind(L"\\\\?\\", 0) == 0)       return s.substr(4);
     return s;
+}
+
+// v0.5.0: the status line is an owner-drawn static (the bottom progress bar),
+// so setting its text must also invalidate it — SetDlgItemText alone doesn't
+// repaint an SS_OWNERDRAW control reliably. All status writes go through here.
+static void SetBeStatus(HWND hDlg, const wchar_t* text) {
+    SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, text ? text : L"");
+    HWND h = GetDlgItem(hDlg, IDC_STATIC_BE_STATUS);
+    if (h) InvalidateRect(h, nullptr, FALSE);
 }
 
 // Convert UTF-8 to wide.
@@ -1051,7 +1062,7 @@ static void ShowHelperRejection(HWND hDlg, const std::wstring& path,
     g_helperFlashTicks = kHelperFlashTickCount;
 
     if (!path.empty()) SetDlgItemTextW(hDlg, IDC_EDIT_BE_BIN, path.c_str());
-    SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, kHelperRejectionMessage);
+    SetBeStatus(hDlg, kHelperRejectionMessage);
     HWND hStat = GetDlgItem(hDlg, IDC_STATIC_BE_STATUS);
     if (hStat && g_boldFont) SendMessageW(hStat, WM_SETFONT, (WPARAM)g_boldFont, TRUE);
 
@@ -1071,7 +1082,7 @@ static void ClearHelperRejection(HWND hDlg) {
         g_helperFlashTicks = 0;
         KillTimer(hDlg, kHelperFlashTimerId);
     }
-    SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"");
+    SetBeStatus(hDlg, L"");
     HWND hStat = GetDlgItem(hDlg, IDC_STATIC_BE_STATUS);
     if (hStat) {
         HFONT base = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0);
@@ -1213,15 +1224,15 @@ static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& nativePath)
     bool wslMode = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
     if (wslMode) {
         const WslInfo& wsl = DetectWslOnce();
-        if      (!wsl.wsl_present)   wcscpy_s(verBuf, L"WSL not detected on this system");
+        if      (!wsl.wsl_present)   wcscpy_s(verBuf, L"WSL not detected");
         else if (!wsl.be_available)  wcscpy_s(verBuf, L"bulk_extractor not found in WSL");
         else if (!wsl.be_version.empty())
-            swprintf_s(verBuf, L"WSL bulk_extractor v%s detected", wsl.be_version.c_str());
+            swprintf_s(verBuf, L"WSL bulk_extractor v%s", wsl.be_version.c_str());
         else                         wcscpy_s(verBuf, L"WSL bulk_extractor detected");
     } else {
         std::wstring path = TrimW(nativePath);
         if (path.empty() || !FileExists(path)) {
-            wcscpy_s(verBuf, L"no Windows bulk_extractor selected");
+            wcscpy_s(verBuf, L"no binary selected");
         } else {
             static std::wstring s_cachePath, s_cacheBanner;
             if (path != s_cachePath) {
@@ -1231,10 +1242,250 @@ static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& nativePath)
             if (!s_cacheBanner.empty())
                 swprintf_s(verBuf, L"%s detected", s_cacheBanner.c_str());
             else
-                wcscpy_s(verBuf, L"Windows binary selected (version unknown)");
+                wcscpy_s(verBuf, L"version unknown");
         }
     }
     SetDlgItemTextW(hDlg, IDC_STATIC_WSL_VERSION, verBuf);
+}
+
+// v0.5.0: paint the bottom status/progress bar (IDC_STATIC_BE_STATUS,
+// SS_OWNERDRAW). States, in priority order:
+//   helper rejected -> red fill (bright/dark alternating during the flash
+//                      window) + dark-red text;
+//   worker running  -> grey track with a sliding light-blue marquee block
+//                      (advanced by the 100 ms elapsed timer) + dark text;
+//   finished text   -> soft green fill ("Done...") or amber ("Cancelled." /
+//                      "Failed...") + dark text;
+//   idle/empty      -> bare track.
+static void DrawStatusBar(const DRAWITEMSTRUCT* dis) {
+    HDC hdc = dis->hDC;
+    RECT rc = dis->rcItem;
+    wchar_t txt[256] = {0};
+    GetWindowTextW(dis->hwndItem, txt, 256);
+    const bool running  = g_workerActive.load();
+    const bool rejected = g_helperRejected;
+    const bool hasText  = txt[0] != 0;
+
+    HBRUSH hbrTrack = CreateSolidBrush(RGB(228, 228, 228));
+    FillRect(hdc, &rc, hbrTrack);
+    DeleteObject(hbrTrack);
+    RECT inner = rc;
+    InflateRect(&inner, -1, -1);
+
+    auto fill = [&](const RECT& r, COLORREF c) {
+        HBRUSH b = CreateSolidBrush(c);
+        FillRect(hdc, &r, b);
+        DeleteObject(b);
+    };
+
+    if (rejected) {
+        bool bright = (g_helperFlashTicks == 0) || ((g_helperFlashTicks & 1) == 0);
+        fill(inner, bright ? RGB(255, 200, 200) : RGB(238, 160, 160));
+    } else if (running) {
+        int w = inner.right - inner.left;
+        int blockW = w / 5; if (blockW < 8) blockW = 8;
+        int span = w + blockW;
+        int x = (int)((GetTickCount64() / 20) % (ULONGLONG)span) - blockW;
+        RECT blk = inner;
+        blk.left  = inner.left + x;
+        blk.right = blk.left + blockW;
+        if (blk.left  < inner.left)  blk.left  = inner.left;
+        if (blk.right > inner.right) blk.right = inner.right;
+        if (blk.right > blk.left) fill(blk, RGB(150, 200, 245));
+    } else if (hasText) {
+        bool bad = wcsncmp(txt, L"Failed", 6) == 0 || wcsncmp(txt, L"Cancelled", 9) == 0;
+        fill(inner, bad ? RGB(250, 224, 170) : RGB(200, 232, 204));
+    }
+    DrawEdge(hdc, &rc, BDR_SUNKENOUTER, BF_RECT);
+
+    if (hasText) {
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rejected ? RGB(150, 0, 0) : RGB(24, 24, 24));
+        HFONT hf  = (HFONT)SendMessageW(GetParent(dis->hwndItem), WM_GETFONT, 0, 0);
+        HFONT old = hf ? (HFONT)SelectObject(hdc, hf) : nullptr;
+        RECT rt = inner; rt.left += 6; rt.right -= 4;
+        DrawTextW(hdc, txt, -1, &rt,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (old) SelectObject(hdc, old);
+    }
+}
+
+// v0.5.0: tooltips. One TOOLTIPS_CLASS window per dialog instance (it is a
+// child-owned popup, destroyed with the dialog), tools registered per control
+// with TTF_SUBCLASS so no message-loop plumbing is needed. Text pointers must
+// be static storage — we only ever pass literals / kScanners entries.
+static HWND CreateDlgTooltips(HWND hDlg) {
+    static bool s_ccInit = false;
+    if (!s_ccInit) {
+        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
+        InitCommonControlsEx(&icc);
+        s_ccInit = true;
+    }
+    HWND tt = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                              WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                              CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                              hDlg, nullptr, g_hSelf, nullptr);
+    if (tt) {
+        SendMessageW(tt, TTM_SETMAXTIPWIDTH, 0, 340);              // wrap long tips
+        SendMessageW(tt, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);   // stay up 20 s
+    }
+    return tt;
+}
+static void AddTip(HWND tt, HWND hDlg, int ctlId, const wchar_t* text) {
+    HWND h = GetDlgItem(hDlg, ctlId);
+    if (!tt || !h || !text) return;
+    TOOLINFOW ti = {};
+    ti.cbSize   = sizeof(ti);
+    ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd     = hDlg;
+    ti.uId      = (UINT_PTR)h;
+    ti.lpszText = const_cast<wchar_t*>(text);
+    SendMessageW(tt, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+static void InstallDlgTooltips(HWND hDlg) {
+    HWND tt = CreateDlgTooltips(hDlg);
+    if (!tt) return;
+    struct { int id; const wchar_t* tip; } const kTips[] = {
+        { IDC_RADIO_INPUT_EVOIMAGE,
+          L"Scan the active evidence object's backing source (E01 / raw image, or a directory-type "
+          L"evidence object). Disabled when X-Ways can't resolve a source path, e.g. physical disks." },
+        { IDC_RADIO_INPUT_PICK,
+          L"Scan an external file or directory of your choosing \u2014 exported data, or data not in the case." },
+        { IDC_EDIT_INPUT_PATH,
+          L"File or directory bulk_extractor will scan. Directories are scanned recursively (-R)." },
+        { IDC_BTN_BROWSE_INPUT_FILE, L"Pick a file to scan." },
+        { IDC_BTN_BROWSE_INPUT_DIR,  L"Pick a directory to scan recursively." },
+        { IDC_RADIO_INPUT_SELECTED,
+          L"Export the items selected in the directory browser to a temp folder and scan that. "
+          L"Only available when the X-Tension is invoked from a right-click selection." },
+        { IDC_CHK_TAG_SCANNED,
+          L"Label every successfully exported item \"bulk_extractor scanned\", so even partial runs "
+          L"leave an audit trail." },
+        { IDC_CHK_TAG_HITS,
+          L"Label items where bulk_extractor found at least one feature \"bulk_extractor hits\"." },
+        { IDC_CHK_TAG_HITS_PER_FEATURE,
+          L"Also add one label per scanner that hit, e.g. \"bulk_extractor: email\", "
+          L"\"bulk_extractor: net\"." },
+        { IDC_STATIC_WSL_VERSION,
+          L"Version of the binary a Run would use, probed via --version." },
+        { IDC_CHK_USE_WSL,
+          L"Run a Linux bulk_extractor through WSL instead of the Windows binary. Windows paths are "
+          L"translated to /mnt/<drive>/... automatically. Greyed out when WSL or a bulk_extractor "
+          L"inside it isn't detected." },
+        { IDC_EDIT_BE_BIN,
+          L"Path to bulk_extractor64.exe (or the Linux binary in WSL mode). Auto-filled from the cfg "
+          L"sidecar or the copy next to the DLL." },
+        { IDC_BTN_BROWSE_BE,
+          L"Pick the bulk_extractor binary. Windows binaries are identity-checked (PE VERSIONINFO or "
+          L"--version banner) before they're accepted." },
+        { IDC_BTN_RESET_SCANNERS, L"Restore bulk_extractor's default scanner set." },
+        { IDC_BTN_TOGGLE_ALL,
+          L"Check every scanner \u2014 or uncheck them all if they're already all checked." },
+        { IDC_EDIT_OUTPUT_DIR,
+          L"Where bulk_extractor writes its feature files and report.xml. A fresh timestamped folder "
+          L"is suggested per run; a reused folder makes bulk_extractor refuse (pre-2.2.0) or silently "
+          L"skip the run (2.2.0)." },
+        { IDC_BTN_BROWSE_OUTPUT, L"Pick an output directory." },
+        { IDC_CHK_ADD_TO_CASE,
+          L"Attach the output directory to the case as a Directory evidence object when the run finishes." },
+        { IDC_CHK_OPEN_FOLDER, L"Open the output directory in Explorer when the run finishes." },
+        { IDC_COMBO_THREADS,
+          L"Worker threads for bulk_extractor (-j). The default leaves half the cores free for X-Ways." },
+        { IDC_EDIT_MAXRECURSE,
+          L"Maximum recursion depth into nested / compressed data (-M). bulk_extractor's default is 12." },
+        { IDC_STATIC_BE_STATUS, L"Run status and progress." },
+        { IDC_BTN_ABOUT,       L"About this X-Tension." },
+        { IDC_BTN_OPEN_OUTPUT,
+          L"Open the output directory in Explorer (its parent folder before the first run)." },
+        { IDOK,
+          L"Start bulk_extractor. Hold Ctrl to save the current settings to bulk_extractor.cfg instead." },
+        { IDCANCEL,
+          L"Close the dialog. While a run is active: stop bulk_extractor. Hold Ctrl to save the "
+          L"settings to a file of your choosing." },
+    };
+    for (const auto& t : kTips) AddTip(tt, hDlg, t.id, t.tip);
+    for (int i = 0; i < kNumScanners; ++i) AddTip(tt, hDlg, IDC_SCANNER_BASE + i, kScanners[i].tip);
+}
+
+// --- About dialog (v0.5.0) --------------------------------------------------
+//   Mirrors xways-ual-timeliner / xways-updater: bold title, description,
+//   bold "Author:" prefix, clickable URL pushbuttons + a "Buy me a coffee"
+//   CTA. Fonts are created in WM_INITDIALOG and freed in WM_DESTROY.
+struct AboutDlgFonts {
+    HFONT hTitleBold  = nullptr;
+    HFONT hPrefixBold = nullptr;
+};
+
+static INT_PTR CALLBACK AboutDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM /*lp*/) {
+    AboutDlgFonts* fonts = (AboutDlgFonts*)GetWindowLongPtrW(hDlg, GWLP_USERDATA);
+    switch (msg) {
+    case WM_INITDIALOG: {
+        fonts = new AboutDlgFonts;
+        SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)fonts);
+
+        HFONT hf = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0);
+        LOGFONTW lf{};
+        if (hf) GetObjectW(hf, sizeof(lf), &lf);
+        LOGFONTW lfTitle = lf;
+        lfTitle.lfWeight = FW_BOLD;
+        lfTitle.lfHeight = (LONG)(lf.lfHeight * 1.20);
+        fonts->hTitleBold = CreateFontIndirectW(&lfTitle);
+        LOGFONTW lfBold = lf; lfBold.lfWeight = FW_BOLD;
+        fonts->hPrefixBold = CreateFontIndirectW(&lfBold);
+
+        SetDlgItemTextW(hDlg, IDC_ABOUT_TITLE,
+                        (std::wstring(L"xways-bulk_extractor  ") + VERSION).c_str());
+        SetDlgItemTextW(hDlg, IDC_ABOUT_DESC, DESCRIPTION);
+        SetDlgItemTextW(hDlg, IDC_ABOUT_LABEL_AUTHOR_PREFIX, L"Author:");
+        SetDlgItemTextW(hDlg, IDC_ABOUT_AUTHOR,
+            L"Kevin Stokes - Digital Detective and Cyber Sleuth");
+        // U+2665 BLACK HEART SUIT \u2014 set programmatically so we don't depend
+        // on rc.exe's input codepage to encode it correctly.
+        SetDlgItemTextW(hDlg, IDC_ABOUT_BTN_COFFEE,
+            L"\u2665 Love this? How about a coffee \u2665");
+
+        if (fonts->hTitleBold)
+            SendDlgItemMessageW(hDlg, IDC_ABOUT_TITLE, WM_SETFONT,
+                                (WPARAM)fonts->hTitleBold, TRUE);
+        if (fonts->hPrefixBold)
+            SendDlgItemMessageW(hDlg, IDC_ABOUT_LABEL_AUTHOR_PREFIX, WM_SETFONT,
+                                (WPARAM)fonts->hPrefixBold, TRUE);
+        return TRUE;
+    }
+    case WM_COMMAND: {
+        WORD id = LOWORD(wp);
+        const wchar_t* url = nullptr;
+        if      (id == IDC_ABOUT_LINK_GITHUB)   url = L"https://github.com/kev365/xways-bulk_extractor";
+        else if (id == IDC_ABOUT_LINK_TOOL)     url = L"https://github.com/simsong/bulk_extractor";
+        else if (id == IDC_ABOUT_LINK_LINKEDIN) url = L"https://www.linkedin.com/in/dfir-kev";
+        else if (id == IDC_ABOUT_BTN_COFFEE)    url = L"https://buymeacoffee.com/dfirkev";
+        if (url) {
+            ShellExecuteW(hDlg, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+            return TRUE;
+        }
+        if (id == IDOK || id == IDCANCEL) {
+            EndDialog(hDlg, id);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        EndDialog(hDlg, IDCANCEL);
+        return TRUE;
+    case WM_DESTROY:
+        if (fonts) {
+            if (fonts->hTitleBold)  DeleteObject(fonts->hTitleBold);
+            if (fonts->hPrefixBold) DeleteObject(fonts->hPrefixBold);
+            delete fonts;
+            SetWindowLongPtrW(hDlg, GWLP_USERDATA, 0);
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static void ShowAboutDialog(HWND parent) {
+    DialogBoxParamW(g_hSelf, MAKEINTRESOURCEW(IDD_ABOUT), parent, AboutDlgProc, 0);
 }
 
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1454,7 +1705,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             }
 
             const int padBot = 8, padLR = 12;
-            const int nCols  = 3;
+            const int nCols  = 4;   // v0.5.0: was 3
             const int nRowsPerCol = (kNumScanners + nCols - 1) / nCols;
 
             // v0.2.8: derive rowH from the checkbox font's actual measured
@@ -1469,12 +1720,12 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                     HFONT old = (HFONT)SelectObject(hdc, cbFont);
                     TEXTMETRICW tm = {};
                     if (GetTextMetricsW(hdc, &tm)) {
-                        rowH = tm.tmHeight + 6;  // 6 px breathing room
+                        rowH = tm.tmHeight + 4;  // v0.5.0: 4 px (was 6) — denser 4-col grid
                     }
                     SelectObject(hdc, old);
                     ReleaseDC(hDlg, hdc);
                 }
-                if (rowH < 18) rowH = 18;  // legibility floor only
+                if (rowH < 16) rowH = 16;  // legibility floor only
             }
 
             int innerW = (br.x - tl.x) - 2 * padLR;
@@ -1563,7 +1814,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         g_cancelRequested.store(false);
         g_runStartTick = 0;
 
-        SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"");
+        SetBeStatus(hDlg, L"");
         if (!s->useWsl && !TrimW(s->beBinary).empty() && FileExists(s->beBinary)) {
             std::wstring idDetail;
             if (!VerifyHelperIdentity(s->beBinary, kHelperIdentityNeedle, idDetail)) {
@@ -1581,6 +1832,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         SetDlgItemTextW(hDlg, IDOK,     L"Run");
         SetDlgItemTextW(hDlg, IDCANCEL, L"Cancel");
         SetTimer(hDlg, kCtrlPollTimerId, 100, nullptr);
+
+        // v0.5.0: tooltips — after every control (incl. the programmatic
+        // scanner checkboxes) exists.
+        InstallDlgTooltips(hDlg);
         return TRUE;
     }
     case WM_CTLCOLORSTATIC: {
@@ -1593,17 +1848,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             SetBkMode(hdc, TRANSPARENT);
             return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
         }
-        // v0.4.0: paint the BE-binary status line red while a rejection is
-        // active — bright/dark alternating during the flash window, solid red
-        // afterward. Other statics fall through to default handling.
-        if (ctlId == IDC_STATIC_BE_STATUS && g_helperRejected) {
-            HDC hdc = (HDC)wp;
-            bool brightPhase = (g_helperFlashTicks == 0) ||
-                               ((g_helperFlashTicks & 1) == 0);
-            SetTextColor(hdc, brightPhase ? RGB(220, 0, 0) : RGB(140, 0, 0));
-            SetBkMode(hdc, TRANSPARENT);
-            return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
-        }
+        // (v0.5.0: the status line is SS_OWNERDRAW — its red rejection flash
+        // is painted in DrawStatusBar via WM_DRAWITEM, not here.)
         break;
     }
     case WM_TIMER: {
@@ -1643,9 +1889,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             ULONGLONG elapsedMs = GetTickCount64() - g_runStartTick;
             unsigned secs = (unsigned)(elapsedMs / 1000);
             wchar_t buf[96];
-            swprintf_s(buf, L"Running bulk_extractor… %02u:%02u (see console window)",
+            swprintf_s(buf, L"Running bulk_extractor\u2026 %02u:%02u (see console window)",
                        secs / 60, secs % 60);
-            SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, buf);
+            SetBeStatus(hDlg, buf);   // also invalidates -> marquee advances
             return TRUE;
         }
         return FALSE;
@@ -1655,6 +1901,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         // + white text while Ctrl is held ("Save"); both otherwise render as a
         // standard 3D button.
         DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
+        if (dis && dis->CtlType == ODT_STATIC && dis->CtlID == IDC_STATIC_BE_STATUS) {
+            DrawStatusBar(dis);   // v0.5.0 bottom status/progress bar
+            return TRUE;
+        }
         if (!dis || dis->CtlType != ODT_BUTTON ||
             (dis->CtlID != IDOK && dis->CtlID != IDCANCEL))
             return FALSE;
@@ -1752,7 +2002,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             // accepting it. Show the rejected path + flash on failure; clear
             // the rejection (re-enabling Run) on success.
             SetDlgItemTextW(hDlg, IDC_EDIT_BE_BIN, p.c_str());
-            SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"(verifying...)");
+            SetBeStatus(hDlg, L"(verifying...)");
             HWND hStat = GetDlgItem(hDlg, IDC_STATIC_BE_STATUS);
             if (hStat) UpdateWindow(hStat);
             std::wstring idDetail;
@@ -1799,11 +2049,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             UpdateBinaryStatusReadout(hDlg, s->beBinary);
             return TRUE;
         }
-        case IDC_BTN_ABOUT: {
-            std::wstring msg = std::wstring(NAME) + L" " + VERSION + L"\n\n" + DESCRIPTION;
-            MessageBoxW(hDlg, msg.c_str(), L"About", MB_OK | MB_ICONINFORMATION);
+        case IDC_BTN_ABOUT:
+            ShowAboutDialog(hDlg);
             return TRUE;
-        }
         case IDC_BTN_OPEN_OUTPUT: {
             // Open the output dir if it exists; fall back to its parent (the
             // per-X-Tension case folder) so the button is useful before the
@@ -1856,7 +2104,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 CfgValues cfg = CollectCfgFromDialog(hDlg, s);
                 std::wstring cfgPath = GetSelfDirectory() + L"\\bulk_extractor.cfg";
                 bool ok = SaveCfg(cfgPath, cfg);
-                SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS,
+                SetBeStatus(hDlg,
                     ok ? L"Settings saved to bulk_extractor.cfg"
                        : L"Failed to save bulk_extractor.cfg (see Messages)");
                 Log(ok ? (L"settings saved via Ctrl+Run: " + cfgPath)
@@ -1967,7 +2215,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 if (!g_cancelRequested.load()) {
                     g_cancelRequested.store(true);
                     EnableWindow(GetDlgItem(hDlg, IDCANCEL), FALSE);
-                    SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"Cancelling…");
+                    SetBeStatus(hDlg, L"Cancelling…");
                     Log(L"Cancel requested — stopping bulk_extractor…");
                 }
                 return TRUE;
@@ -2007,7 +2255,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
     case WM_APP_STATUS: {
         wchar_t* text = (wchar_t*)lp;
         if (text) {
-            SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, text);
+            SetBeStatus(hDlg, text);
             delete[] text;
         }
         return TRUE;
@@ -2033,10 +2281,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             if (didMutate) g_run.didMutate = true;
         }
         switch (wp) {
-        case 0: SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS,
+        case 0: SetBeStatus(hDlg,
                     L"Done. See Messages window for the run summary."); break;
-        case 1: SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS, L"Cancelled."); break;
-        case 2: SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS,
+        case 1: SetBeStatus(hDlg, L"Cancelled."); break;
+        case 2: SetBeStatus(hDlg,
                     L"Failed: bulk_extractor returned a nonzero exit code (see Messages)."); break;
         default: break;  // 3: specific failure text already shown
         }
@@ -3008,9 +3256,9 @@ static void StartBeWorker(HWND hDlg) {
         HWND h = GetDlgItem(hDlg, IDC_SCANNER_BASE + i);
         if (h) EnableWindow(h, FALSE);
     }
-    SetDlgItemTextW(hDlg, IDC_STATIC_BE_STATUS,
+    SetBeStatus(hDlg,
                     L"Running bulk_extractor… 00:00 (see console window)");
-    SetTimer(hDlg, kElapsedTimerId, 1000, nullptr);
+    SetTimer(hDlg, kElapsedTimerId, 100, nullptr);   // v0.5.0: 100 ms drives the marquee
 
     // JOINABLE worker (P2) running ONLY the subprocess phase (P1 -- no XWF_*
     // calls off X-Ways' thread). g_workerSettings / g_workerPrep are stable
@@ -3242,9 +3490,11 @@ LONG __stdcall XT_Init(DWORD nVersion, DWORD nFlags, HWND hMainWnd, void*) {
     return 1;
 }
 
-LONG __stdcall XT_About(HWND, void*) {
+LONG __stdcall XT_About(HWND hParentWnd, void*) {
     std::wstring msg = NAME; msg += L" "; msg += VERSION; msg += L"\n"; msg += DESCRIPTION;
     if (XWF_OutputMessage) XWF_OutputMessage(msg.c_str(), 0);
+    // v0.5.0: same About dialog the in-dialog button shows.
+    ShowAboutDialog(hParentWnd ? hParentWnd : g_hMainWnd);
     return 0;
 }
 

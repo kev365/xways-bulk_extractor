@@ -50,6 +50,17 @@
 #define IDC_BTN_ABOUT               160
 #define IDC_BTN_OPEN_OUTPUT         161
 
+// v0.5.0: About dialog (mirrors xways-ual-timeliner / xways-updater).
+#define IDD_ABOUT                   200
+#define IDC_ABOUT_TITLE             201
+#define IDC_ABOUT_DESC              202
+#define IDC_ABOUT_LABEL_AUTHOR_PREFIX 203
+#define IDC_ABOUT_AUTHOR            204
+#define IDC_ABOUT_LINK_GITHUB       205
+#define IDC_ABOUT_LINK_TOOL         206  // upstream bulk_extractor repo
+#define IDC_ABOUT_LINK_LINKEDIN     207
+#define IDC_ABOUT_BTN_COFFEE        208
+
 // Output handling
 #define IDC_GROUP_OUTPUT            150
 #define IDC_CHK_ADD_TO_CASE         151

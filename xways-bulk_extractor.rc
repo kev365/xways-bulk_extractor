@@ -29,7 +29,7 @@
 //
 // v0.2.7+: dialog font 10pt for non-scanner controls; scanner checkboxes
 // programmatically created with their own 9pt font for density.
-IDD_SETTINGS DIALOGEX 0, 0, 400, 468
+IDD_SETTINGS DIALOGEX 0, 0, 400, 482
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "bulk_extractor - Settings"
 FONT 10, "MS Shell Dlg"
@@ -62,9 +62,11 @@ BEGIN
     // checkbox is auto-disabled by C++ if WSL or BE-in-WSL is unavailable.
     // y=130 (was 158) — shifted up after the standalone Output directory
     // section moved into the Output handling group below.
-    LTEXT           "bulk_extractor binary:",                           IDC_LABEL_BE_BIN,           7, 130, 100,   8
-    AUTOCHECKBOX    "Run via WSL (use Linux bulk_extractor)",           IDC_CHK_USE_WSL,          110, 130, 160,  10
-    LTEXT           "",                                                 IDC_STATIC_WSL_VERSION,   275, 130, 114,   8
+    // v0.5.0: the detected-version readout sits right after the label; the
+    // WSL checkbox is right-justified on the same row.
+    LTEXT           "bulk_extractor binary:",                           IDC_LABEL_BE_BIN,           7, 130,  92,   8
+    LTEXT           "",                                                 IDC_STATIC_WSL_VERSION,   100, 130, 122,   8, SS_NOTIFY
+    AUTOCHECKBOX    "Run via WSL (use Linux bulk_extractor)",           IDC_CHK_USE_WSL,          225, 130, 164,  10
     EDITTEXT                                                            IDC_EDIT_BE_BIN,            7, 140, 332,  12, ES_AUTOHSCROLL
     PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_BE,        342, 139,  47,  14
     // v0.5.0: the status/progress line (IDC_STATIC_BE_STATUS) moved from the
@@ -107,11 +109,34 @@ BEGIN
     // blue ("Save") and swap Cancel's label to "Save as...". DM_SETDEFID (set
     // in WM_INITDIALOG) keeps Enter triggering Run without DEFPUSHBUTTON,
     // which conflicts with BS_OWNERDRAW.
-    PUSHBUTTON      "About",                                            IDC_BTN_ABOUT,              7, 448,  45,  14
-    PUSHBUTTON      "Open output",                                      IDC_BTN_OPEN_OUTPUT,       56, 448,  60,  14
-    LTEXT           "",                                                 IDC_STATIC_BE_STATUS,     122, 451, 157,   9
-    PUSHBUTTON      "Run",                                              IDOK,                     283, 448,  50,  14, BS_OWNERDRAW
-    PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 448,  50,  14, BS_OWNERDRAW
+    // v0.5.0: owner-drawn status/progress bar spanning the width above the
+    // button row. Idle = empty track; running = marquee; done = soft fill;
+    // helper rejection = red flash. The status text is drawn INSIDE the bar.
+    CONTROL         "",                                                 IDC_STATIC_BE_STATUS,     "Static", SS_OWNERDRAW | SS_NOTIFY | WS_CHILD | WS_VISIBLE, 7, 444, 386, 12
+    PUSHBUTTON      "About",                                            IDC_BTN_ABOUT,              7, 461,  45,  14
+    PUSHBUTTON      "Open output",                                      IDC_BTN_OPEN_OUTPUT,       56, 461,  60,  14
+    PUSHBUTTON      "Run",                                              IDOK,                     283, 461,  50,  14, BS_OWNERDRAW
+    PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 461,  50,  14, BS_OWNERDRAW
+END
+
+// =============================================================================
+//  About dialog (v0.5.0) -- mirrors xways-ual-timeliner / xways-updater: bold
+//  title, description, bold "Author:" prefix, clickable URL buttons, coffee CTA.
+// =============================================================================
+IDD_ABOUT DIALOGEX 0, 0, 300, 158
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About xways-bulk_extractor"
+FONT 9, "MS Shell Dlg"
+BEGIN
+    LTEXT     "xways-bulk_extractor",                             IDC_ABOUT_TITLE,        12,  10, 276, 12
+    LTEXT     "",                                                 IDC_ABOUT_DESC,         12,  26, 276, 18
+    LTEXT     "Author:",                                          IDC_ABOUT_LABEL_AUTHOR_PREFIX, 12, 50,  30, 9
+    LTEXT     "",                                                 IDC_ABOUT_AUTHOR,       44,  50, 244,  9
+    PUSHBUTTON "https://github.com/kev365/xways-bulk_extractor",  IDC_ABOUT_LINK_GITHUB,  12,  64, 276, 14
+    PUSHBUTTON "https://github.com/simsong/bulk_extractor",       IDC_ABOUT_LINK_TOOL,    12,  82, 276, 14
+    PUSHBUTTON "https://www.linkedin.com/in/dfir-kev",            IDC_ABOUT_LINK_LINKEDIN, 12, 100, 276, 14
+    PUSHBUTTON "Buy me a coffee",                                 IDC_ABOUT_BTN_COFFEE,   12, 118, 276, 14
+    DEFPUSHBUTTON "OK",                                           IDOK,                  238, 140,  50, 14
 END
 
 // =============================================================================

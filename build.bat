@@ -32,7 +32,7 @@ set CXXFLAGS=/nologo /std:c++17 /W3 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE
 set LDFLAGS=/DLL /DEF:%NAME%.def /OUT:%OUT% /MACHINE:X64
 REM Version.lib (v0.4.0): helper-exe identity verification reads the PE
 REM VERSIONINFO resource via GetFileVersionInfo* / VerQueryValue.
-set LIBS=Comdlg32.lib Shell32.lib User32.lib Ole32.lib Advapi32.lib Shlwapi.lib Gdi32.lib Version.lib
+set LIBS=Comdlg32.lib Shell32.lib User32.lib Ole32.lib Advapi32.lib Shlwapi.lib Gdi32.lib Version.lib Comctl32.lib
 
 if exist *.obj del /q *.obj
 if exist *.res del /q *.res
