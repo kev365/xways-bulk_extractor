@@ -1579,6 +1579,36 @@ static void ShowAboutDialog(HWND parent) {
     DialogBoxParamW(g_hSelf, MAKEINTRESOURCEW(IDD_ABOUT), parent, AboutDlgProc, 0);
 }
 
+// v0.5.0: single-line EDIT controls top-align their text, so a template
+// height with slack (12 DLU at FONT 10 is ~24 px for ~18 px of text) renders
+// visibly top-heavy. Resize every single-line edit to its font's line height
+// plus border padding, keeping the control's vertical centre, so the text
+// sits centred in the box and level with the buttons beside it.
+static void FitSingleLineEdits(HWND hDlg, const int* ids, size_t count) {
+    const int pad = 2 * GetSystemMetrics(SM_CYEDGE) + 2;   // border + 1 px breathing each side
+    for (size_t i = 0; i < count; ++i) {
+        HWND h = GetDlgItem(hDlg, ids[i]);
+        if (!h) continue;
+        HFONT hf = (HFONT)SendMessageW(h, WM_GETFONT, 0, 0);
+        HDC hdc = GetDC(h);
+        if (!hdc) continue;
+        HFONT old = hf ? (HFONT)SelectObject(hdc, hf) : nullptr;
+        TEXTMETRICW tm = {};
+        bool ok = GetTextMetricsW(hdc, &tm) != 0;
+        if (old) SelectObject(hdc, old);
+        ReleaseDC(h, hdc);
+        if (!ok) continue;
+        RECT r; GetWindowRect(h, &r);
+        MapWindowPoints(HWND_DESKTOP, hDlg, (POINT*)&r, 2);
+        const int curH = r.bottom - r.top;
+        const int newH = tm.tmHeight + pad;
+        if (newH >= curH) continue;                     // never grow past the template
+        const int newTop = r.top + (curH - newH) / 2;
+        SetWindowPos(h, nullptr, r.left, newTop, r.right - r.left, newH,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     static Settings* s = nullptr;
     switch (msg) {
@@ -1964,6 +1994,15 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         SetDlgItemTextW(hDlg, IDOK,     L"Run");
         SetDlgItemTextW(hDlg, IDCANCEL, L"Cancel");
         SetTimer(hDlg, kCtrlPollTimerId, 100, nullptr);
+
+        // v0.5.0: centre the text in every single-line edit (see
+        // FitSingleLineEdits) — after the auto-fit/snap has settled positions.
+        {
+            static const int kEdits[] = {
+                IDC_EDIT_BE_BIN, IDC_EDIT_INPUT_PATH, IDC_EDIT_OUTPUT_DIR, IDC_EDIT_MAXRECURSE,
+            };
+            FitSingleLineEdits(hDlg, kEdits, sizeof(kEdits) / sizeof(kEdits[0]));
+        }
 
         // v0.5.0: tooltips — after every control (incl. the programmatic
         // scanner checkboxes) exists.
