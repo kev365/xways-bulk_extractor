@@ -66,9 +66,10 @@ BEGIN
     // WSL checkbox is right-justified on the same row.
     LTEXT           "bulk_extractor binary:",                           IDC_LABEL_BE_BIN,           7, 130,  92,   8
     LTEXT           "",                                                 IDC_STATIC_WSL_VERSION,   100, 130, 122,   8, SS_NOTIFY
-    AUTOCHECKBOX    "Run via WSL (use Linux bulk_extractor)",           IDC_CHK_USE_WSL,          225, 130, 164,  10
-    EDITTEXT                                                            IDC_EDIT_BE_BIN,            7, 140, 332,  12, ES_AUTOHSCROLL
-    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_BE,        342, 139,  47,  14
+    AUTOCHECKBOX    "Run via WSL (use Linux bulk_extractor)",           IDC_CHK_USE_WSL,          254, 130, 135,  10
+    // v0.5.0: path row dropped 4 DLU for breathing room under the info row.
+    EDITTEXT                                                            IDC_EDIT_BE_BIN,            7, 144, 332,  12, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_BE,        342, 143,  47,  14
     // v0.5.0: the status/progress line (IDC_STATIC_BE_STATUS) moved from the
     // gap below this edit to the bottom bar, inline with Run/Cancel.
 
@@ -85,20 +86,24 @@ BEGIN
     // Open folder. Threads/Max recursion sit on the right, parallel with
     // the two checkboxes (NOT the path edit) so the right-column controls
     // visually align with the action items.
-    GROUPBOX        "Output handling",                                  IDC_GROUP_OUTPUT,           7, 370, 283,  72
-    LTEXT           "Output directory:",                                IDC_LABEL_OUTPUT,          14, 384,  80,   8
-    EDITTEXT                                                            IDC_EDIT_OUTPUT_DIR,       14, 394, 215,  12, ES_AUTOHSCROLL
-    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_OUTPUT,    233, 393,  47,  14
-    AUTOCHECKBOX    "Add output directory to X-Ways case as evidence object (Directory)",
-                                                                        IDC_CHK_ADD_TO_CASE,       14, 414, 263,  10
-    AUTOCHECKBOX    "Open output folder in Explorer when done",         IDC_CHK_OPEN_FOLDER,       14, 428, 263,  10
+    // v0.5.0: Threads / Max recursion live in the right column under
+    // Check/Uncheck all. Their template y is a placeholder — WM_INITDIALOG
+    // snaps them to sit directly above the Output handling group after the
+    // scanner-group auto-fit has settled the group's final position.
+    LTEXT           "Threads:",                                         IDC_LABEL_THREADS,        297, 224,  50,   8
+    COMBOBOX                                                            IDC_COMBO_THREADS,        350, 222,  43, 200, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Max recursion:",                                   IDC_LABEL_MAXRECURSE,     297, 240,  55,   8
+    EDITTEXT                                                            IDC_EDIT_MAXRECURSE,      355, 238,  38,  12, ES_AUTOHSCROLL | ES_NUMBER
 
-    // Threads stacked over Max recursion on the right, parallel with the
-    // two checkboxes inside Output handling.
-    LTEXT           "Threads:",                                         IDC_LABEL_THREADS,        297, 414,  50,   8
-    COMBOBOX                                                            IDC_COMBO_THREADS,        350, 412,  43, 200, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Max recursion:",                                   IDC_LABEL_MAXRECURSE,     297, 428,  55,   8
-    EDITTEXT                                                            IDC_EDIT_MAXRECURSE,      355, 426,  38,  12, ES_AUTOHSCROLL | ES_NUMBER
+    // v0.5.0: Output handling spans the full dialog width now that the
+    // Threads / Max recursion pair moved up into the right column.
+    GROUPBOX        "Output handling",                                  IDC_GROUP_OUTPUT,           7, 370, 386,  72
+    LTEXT           "Output directory:",                                IDC_LABEL_OUTPUT,          14, 384,  80,   8
+    EDITTEXT                                                            IDC_EDIT_OUTPUT_DIR,       14, 394, 318,  12, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_OUTPUT,    336, 393,  47,  14
+    AUTOCHECKBOX    "Add output directory to X-Ways case as evidence object (Directory)",
+                                                                        IDC_CHK_ADD_TO_CASE,       14, 414, 366,  10
+    AUTOCHECKBOX    "Open output folder in Explorer when done",         IDC_CHK_OPEN_FOLDER,       14, 428, 366,  10
 
     // -------- Bottom bar: About / Open output | status | Run / Cancel -----
     // v0.5.0: About + Open output on the left; the status/progress +

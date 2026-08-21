@@ -1735,8 +1735,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             int ys = tl.y + padTop;
 
             for (int i = 0; i < kNumScanners; ++i) {
-                int row = i / nCols;
-                int col = i % nCols;
+                // v0.5.0: column-major — alphabetical order runs DOWN each
+                // column, then continues at the top of the next one.
+                int row = i % nRowsPerCol;
+                int col = i / nRowsPerCol;
                 int x = xs + col * colW;
                 int y = ys + row * rowH;
                 HWND cb = CreateWindowExW(
@@ -1773,8 +1775,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                     IDC_GROUP_OUTPUT,
                     IDC_LABEL_OUTPUT, IDC_EDIT_OUTPUT_DIR, IDC_BTN_BROWSE_OUTPUT,
                     IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
-                    IDC_LABEL_THREADS,    IDC_COMBO_THREADS,
-                    IDC_LABEL_MAXRECURSE, IDC_EDIT_MAXRECURSE,
+                    // (v0.5.0: Threads / Max recursion are NOT shifted — they
+                    // are snapped above the Output group after this block.)
                     // v0.5.0 bottom bar: About / Open output / status line
                     // moved down here with Run/Cancel.
                     IDC_BTN_ABOUT, IDC_BTN_OPEN_OUTPUT, IDC_STATIC_BE_STATUS,
@@ -1794,6 +1796,43 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                              rcDlg.right  - rcDlg.left,
                              rcDlg.bottom - rcDlg.top - delta,
                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+
+            // v0.5.0: snap the Threads / Max recursion pair (right column,
+            // under Check/Uncheck all) so it sits directly above the Output
+            // handling group wherever the auto-fit left that group. Their
+            // relative row pitch and label/control offsets come from the
+            // template; only the vertical position changes. Never pushed up
+            // into the Check/Uncheck all button.
+            {
+                auto clientRc = [&](int id, RECT& out) -> bool {
+                    HWND h = GetDlgItem(hDlg, id);
+                    if (!h) return false;
+                    GetWindowRect(h, &out);
+                    MapWindowPoints(HWND_DESKTOP, hDlg, (POINT*)&out, 2);
+                    return true;
+                };
+                auto moveBy = [&](int id, int dy) {
+                    RECT r;
+                    if (!clientRc(id, r)) return;
+                    SetWindowPos(GetDlgItem(hDlg, id), nullptr, r.left, r.top + dy, 0, 0,
+                                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                };
+                RECT rOut, rTog, rTC, rME;
+                if (clientRc(IDC_GROUP_OUTPUT, rOut) && clientRc(IDC_BTN_TOGGLE_ALL, rTog) &&
+                    clientRc(IDC_COMBO_THREADS, rTC) && clientRc(IDC_EDIT_MAXRECURSE, rME)) {
+                    const int pitch  = rME.top - rTC.top;            // template row spacing
+                    const int gapPx  = MulDiv(6, rME.bottom - rME.top, 12);  // ~6 DLU in px
+                    int meTop = rOut.top - gapPx - (rME.bottom - rME.top);
+                    int minTop = rTog.bottom + gapPx + pitch;        // stay below Toggle
+                    if (meTop < minTop) meTop = minTop;
+                    const int dM = meTop - rME.top;
+                    const int dT = (meTop - pitch) - rTC.top;
+                    moveBy(IDC_EDIT_MAXRECURSE,  dM);
+                    moveBy(IDC_LABEL_MAXRECURSE, dM);
+                    moveBy(IDC_COMBO_THREADS,    dT);
+                    moveBy(IDC_LABEL_THREADS,    dT);
+                }
             }
         }
 
@@ -3128,8 +3167,12 @@ static RunOutcome ExecuteBeRun(const Settings& s, const RunPrep& prep,
     PostWorkerStatus(L"Running bulk_extractor… (see console window)");
     bool ok = RunBulkExtractor(s, inputForBE, exitCodeOut, runErr, pumpMessages);
     {
-        wchar_t buf[160];
+        wchar_t buf[320];
         swprintf_s(buf, L"bulk_extractor exit code: %lu", (unsigned long)exitCodeOut);
+        if (exitCodeOut == 0xC000013A) {   // STATUS_CONTROL_C_EXIT
+            wcscat_s(buf, L" (0xC000013A: bulk_extractor's console window was closed "
+                          L"or Ctrl+C was pressed — use the dialog's Cancel button instead)");
+        }
         Log(buf);
     }
     if (!ok && !runErr.empty()) Log(L"error: " + runErr);
@@ -3138,9 +3181,17 @@ static RunOutcome ExecuteBeRun(const Settings& s, const RunPrep& prep,
 
 static void PostProcessRun(const Settings& s, const RunPrep& prep,
                            bool beRanOk, bool* outDidMutate) {
-    if (s.openFolder) OpenInExplorer(s.outputDir);
+    // v0.5.0: a cancelled or failed run leaves a partial output dir. Don't
+    // attach it to the case, open it, or tag from it — that turns an abort
+    // into case noise. Leave it on disk and say where it is; the analyst can
+    // inspect it via Open output or add it by hand if it's actually useful.
+    if (!beRanOk) {
+        Log(L"partial output left on disk (not added to the case): " + s.outputDir);
+    }
 
-    if (s.addToCase) {
+    if (beRanOk && s.openFolder) OpenInExplorer(s.outputDir);
+
+    if (beRanOk && s.addToCase) {
         if (AddOutputAsEvidence(s.outputDir)) {
             if (outDidMutate) *outDidMutate = true;
         } else {
@@ -3148,7 +3199,7 @@ static void PostProcessRun(const Settings& s, const RunPrep& prep,
         }
     }
 
-    if (s.tagHits && s.inputMode == InputMode::SelectedItems) {
+    if (beRanOk && s.tagHits && s.inputMode == InputMode::SelectedItems) {
         FeatureHits fh = CollectHitsByFeature(s.outputDir);
         // 1) Always (when tagHits) apply the umbrella "bulk_extractor hits"
         //    label to every item with at least one hit in any feature.
