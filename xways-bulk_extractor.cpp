@@ -125,7 +125,7 @@ struct ScannerInfo {
 
 static const ScannerInfo kScanners[] = {
     {L"accts",          true , L"Scans for credit card numbers, track-2 data, PII (SSN, Canadian SIN) and phone numbers"},
-    {L"aes",            true , L"Searches for AES key schedules (128/192/256-bit keys in memory or swap)"},
+    {L"aes",            true , L"Searches for AES key schedules (128/192/256-bit)"},
     {L"base16",         false, L"Base16 (hex-encoded) data scanner"},
     {L"base64",         true , L"Scans for Base64-encoded data and recurses into it"},
     {L"elf",            true , L"Finds ELF (Linux/Unix executable) headers"},
@@ -160,7 +160,7 @@ static const ScannerInfo kScanners[] = {
     {L"utmp",           true , L"Scans for utmp/wtmp login records"},
     {L"vcard_carved",   true , L"Scans for and carves vCard data"},
     {L"vin",            true , L"Scans for Vehicle Identification Numbers (BE 2.2.0+)"},   // BE 2.2.0+: Vehicle Identification Numbers
-    {L"windirs",        true , L"Scans Microsoft directory structures (FAT32 / exFAT entries)"},
+    {L"windirs",        true , L"Scans Microsoft directory structures (FAT32 directory entries and NTFS MFT records)"},
     {L"winlnk",         true , L"Searches for Windows LNK (shortcut) files"},
     {L"winpe",          true , L"Scans for Windows PE (executable) headers"},
     {L"winprefetch",    true , L"Searches for Windows Prefetch files"},
@@ -1163,6 +1163,93 @@ static void       PostProcessRun(const Settings& s, const RunPrep& prep,
 static RunPrep g_workerPrep;  // dialog path: filled by IDOK, read by worker + WM_APP_DONE
 
 // Enable/disable controls based on the selected input radio.
+// --- v0.5.0: "Scan target:" summary ----------------------------------------
+//   One line inside the Input source group telling the analyst what a Run
+//   will actually feed to bulk_extractor, and how big it is. Cheap for files
+//   and selected items; directories get a bounded walk (50k files / 1.5 s,
+//   "+" marks a truncated count) so a huge tree can't stall the dialog.
+static std::wstring HumanSize(UINT64 b) {
+    static const wchar_t* kUnits[] = { L"bytes", L"KB", L"MB", L"GB", L"TB" };
+    double v = (double)b; int i = 0;
+    while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
+    wchar_t buf[64];
+    if (i == 0) swprintf_s(buf, L"%llu bytes", (unsigned long long)b);
+    else        swprintf_s(buf, L"%.1f %s", v, kUnits[i]);
+    return buf;
+}
+
+static void WalkDirStats(const std::wstring& dir, UINT64& files, UINT64& bytes,
+                         bool& capped, ULONGLONG deadlineTick, UINT64 maxFiles) {
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd,
+                                FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (capped) break;
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;   // no junction loops
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            WalkDirStats(dir + L"\\" + fd.cFileName, files, bytes, capped, deadlineTick, maxFiles);
+        } else {
+            ++files;
+            bytes += ((UINT64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            if (files >= maxFiles || GetTickCount64() > deadlineTick) capped = true;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static std::wstring DescribePathTarget(const std::wstring& rawPath) {
+    std::wstring p = TrimW(rawPath);
+    if (p.empty()) return L"(no path entered)";
+    while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+    size_t slash = p.find_last_of(L"\\/");
+    std::wstring leaf = (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+    if (leaf.empty()) leaf = p;
+    if (FileExists(p)) {
+        WIN32_FILE_ATTRIBUTE_DATA fad = {};
+        UINT64 sz = 0;
+        if (GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad))
+            sz = ((UINT64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        return leaf + L" \u2014 " + HumanSize(sz);
+    }
+    if (DirExists(p)) {
+        UINT64 files = 0, bytes = 0; bool capped = false;
+        WalkDirStats(p, files, bytes, capped, GetTickCount64() + 1500, 50000);
+        wchar_t buf[200];
+        swprintf_s(buf, L"%s \u2014 directory, %llu%s files, %s%s",
+                   leaf.c_str(), (unsigned long long)files, capped ? L"+" : L"",
+                   HumanSize(bytes).c_str(), capped ? L"+" : L"");
+        return buf;
+    }
+    return leaf + L" \u2014 (path not found)";
+}
+
+static void UpdateScanTarget(HWND hDlg) {
+    std::wstring text;
+    if (IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_SELECTED) == BST_CHECKED) {
+        UINT64 bytes = 0;
+        const size_t n = g_run.selected.size();
+        if (XWF_GetItemSize) {
+            for (LONG id : g_run.selected) {
+                INT64 sz = XWF_GetItemSize(id);
+                if (sz > 0) bytes += (UINT64)sz;
+            }
+        }
+        wchar_t buf[128];
+        swprintf_s(buf, L"%zu selected item%s \u2014 %s",
+                   n, n == 1 ? L"" : L"s", HumanSize(bytes).c_str());
+        text = buf;
+    } else {
+        // Active-EO and External modes both run whatever the path field holds
+        // (the EO source is pre-filled into it), so describe the field.
+        std::wstring p;
+        DlgGetText(hDlg, IDC_EDIT_INPUT_PATH, p);
+        text = DescribePathTarget(p);
+    }
+    SetDlgItemTextW(hDlg, IDC_STATIC_SCAN_TARGET, text.c_str());
+}
+
 static void UpdateInputState(HWND hDlg, const Settings* s) {
     bool isPick     = IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_PICK)     == BST_CHECKED;
     EnableWindow(GetDlgItem(hDlg, IDC_EDIT_INPUT_PATH),       isPick);
@@ -1189,6 +1276,7 @@ static void UpdateInputState(HWND hDlg, const Settings* s) {
         EnableWindow(GetDlgItem(hDlg, IDC_RADIO_INPUT_EVOIMAGE), s->hasActiveEoImage ? TRUE : FALSE);
         EnableWindow(GetDlgItem(hDlg, IDC_RADIO_INPUT_SELECTED), s->selectionMode    ? TRUE : FALSE);
     }
+    UpdateScanTarget(hDlg);   // v0.5.0: mode changed -> refresh the summary line
 }
 
 // Settings controls disabled while a run is in flight, re-enabled by the
@@ -1368,6 +1456,9 @@ static void InstallDlgTooltips(HWND hDlg) {
           L"\"bulk_extractor: net\"." },
         { IDC_STATIC_WSL_VERSION,
           L"Version of the binary a Run would use, probed via --version." },
+        { IDC_STATIC_SCAN_TARGET,
+          L"What a Run will feed to bulk_extractor, with its size. Directory counts are a bounded "
+          L"walk (50,000 files / 1.5 s) \u2014 a trailing + means there is more." },
         { IDC_CHK_USE_WSL,
           L"Run a Linux bulk_extractor through WSL instead of the Windows binary. Windows paths are "
           L"translated to /mnt/<drive>/... automatically. Greyed out when WSL or a bulk_extractor "
@@ -1541,6 +1632,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             }
             if (s_groupTitleFont) {
                 static const int kGroupIds[] = {
+                    IDC_GROUP_BINARY,   // v0.5.0
                     IDC_GROUP_INPUT, IDC_GROUP_SCANNERS, IDC_GROUP_OUTPUT,
                 };
                 for (int id : kGroupIds) {
@@ -1551,6 +1643,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             }
             if (s_labelFont) {
                 static const int kLabelIds[] = {
+                    IDC_LABEL_SCAN_TARGET,   // v0.5.0
                     IDC_LABEL_OUTPUT, IDC_LABEL_BE_BIN,
                     IDC_LABEL_THREADS, IDC_LABEL_MAXRECURSE,
                     // v0.3.0: WSL-version status text rendered bold to match
@@ -1881,7 +1974,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         HWND hCtl = (HWND)lp;
         WORD ctlId = (WORD)GetDlgCtrlID(hCtl);
         // v0.3.0: paint the WSL-version status label blue.
-        if (ctlId == IDC_STATIC_WSL_VERSION) {
+        if (ctlId == IDC_STATIC_WSL_VERSION || ctlId == IDC_STATIC_SCAN_TARGET) {
             HDC hdc = (HDC)wp;
             SetTextColor(hdc, RGB(0, 64, 192));   // calm blue, not neon
             SetBkMode(hdc, TRANSPARENT);
@@ -2000,16 +2093,25 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             UpdateInputState(hDlg, s);
             return TRUE;
 
+        case IDC_EDIT_INPUT_PATH:
+            if (evt == EN_KILLFOCUS) UpdateScanTarget(hDlg);   // typed path settled
+            return TRUE;
         case IDC_BTN_BROWSE_INPUT_FILE: {
             std::wstring p;
             DlgGetText(hDlg, IDC_EDIT_INPUT_PATH, p);
-            if (BrowseForFile(hDlg, p)) SetDlgItemTextW(hDlg, IDC_EDIT_INPUT_PATH, p.c_str());
+            if (BrowseForFile(hDlg, p)) {
+                SetDlgItemTextW(hDlg, IDC_EDIT_INPUT_PATH, p.c_str());
+                UpdateScanTarget(hDlg);
+            }
             return TRUE;
         }
         case IDC_BTN_BROWSE_INPUT_DIR: {
             std::wstring p;
             DlgGetText(hDlg, IDC_EDIT_INPUT_PATH, p);
-            if (BrowseForFolder(hDlg, p)) SetDlgItemTextW(hDlg, IDC_EDIT_INPUT_PATH, p.c_str());
+            if (BrowseForFolder(hDlg, p)) {
+                SetDlgItemTextW(hDlg, IDC_EDIT_INPUT_PATH, p.c_str());
+                UpdateScanTarget(hDlg);
+            }
             return TRUE;
         }
         case IDC_BTN_BROWSE_OUTPUT: {

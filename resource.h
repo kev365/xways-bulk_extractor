@@ -49,6 +49,11 @@
 // the Run/Cancel row.
 #define IDC_BTN_ABOUT               160
 #define IDC_BTN_OPEN_OUTPUT         161
+// v0.5.0: binary group moved to the top; "Scan target:" summary line inside
+// the Input source group.
+#define IDC_GROUP_BINARY            162
+#define IDC_LABEL_SCAN_TARGET       163
+#define IDC_STATIC_SCAN_TARGET      164
 
 // v0.5.0: About dialog (mirrors xways-ual-timeliner / xways-updater).
 #define IDD_ABOUT                   200
