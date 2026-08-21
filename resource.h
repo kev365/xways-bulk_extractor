@@ -72,7 +72,7 @@
 #define IDC_CHK_OPEN_FOLDER         152
 #define IDC_CHK_TAG_SCANNED         153
 #define IDC_CHK_TAG_HITS            154
-#define IDC_CHK_TAG_HITS_PER_FEATURE 155  // sub-option of IDC_CHK_TAG_HITS
+#define IDC_CHK_TAG_HITS_UMBRELLA   155  // sub-option of IDC_CHK_TAG_HITS: add the "BE hits" umbrella label
 
 // Worker thread posts these to the settings-dialog HWND (handled in
 // SettingsDlgProc). See the in-DLL Cancel design spec.

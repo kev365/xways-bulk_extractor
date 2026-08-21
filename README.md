@@ -169,8 +169,8 @@ If a feature filename appears that you want to *suppress* via the dialog (rather
 - **Output handling** — four checkboxes:
   - Add output dir as evidence (default on).
   - Open in Explorer when done.
-  - Tag scanned source items as `bulk_extractor scanned` (selected-items mode only, default on) — every successfully exported item gets the tag, so even partial runs leave an audit trail.
-  - Tag items with feature hits as `bulk_extractor hits` (selected-items mode only, default on) — subset of "scanned" where bulk_extractor found ≥1 feature; mapped via the `xwitem_<itemID>_` token in the temp filenames.
+  - Label scanned source items `BE scanned` (selected-items mode only, default on) — every successfully exported item gets the label, so even partial runs leave an audit trail.
+  - Label items with feature hits per scanner — `BE: email`, `BE: net`, `BE: vin`, … (selected-items mode only, default on) — subset of "scanned" where bulk_extractor found ≥1 feature; mapped via the `xwitem_<itemID>_` token in the temp filenames. Sub-option: also add one umbrella `BE hits` label to every item with any hit (default off). *(v0.5.0: label names shortened from `bulk_extractor …` to `BE …`; per-scanner labels became the default and the umbrella the option.)*
 
 ## Inputs
 
@@ -186,8 +186,8 @@ Three checkboxes in the dialog (default = first only):
 
 - **Add output directory to X-Ways case as evidence object** — calls `XWF_CreateEvObj(nType=3, ...)` (Directory). Lets X-Ways index the feature files alongside the rest of the case.
 - **Open output folder in Explorer when done** — `ShellExecuteW`.
-- **Tag scanned source items** (selected-items mode only) — every successfully exported item is tagged with the report table `bulk_extractor scanned` at export time. Audit trail of "what did we run BE on, when".
-- **Tag items with feature hits** (selected-items mode only) — items whose exported temp file appears in any feature file get tagged with the report table `bulk_extractor hits`. Subset of "scanned".
+- **Label scanned source items** (selected-items mode only) — every successfully exported item gets the label `BE scanned` at export time. Audit trail of "what did we run BE on, when".
+- **Label items with feature hits** (selected-items mode only) — items whose exported temp file appears in a feature file get one label per scanner that hit (`BE: email`, `BE: net`, …); optionally also the umbrella `BE hits`. Subset of "scanned".
 
 ## Bundle layout
 

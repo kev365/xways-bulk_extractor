@@ -73,8 +73,9 @@
 static const wchar_t* NAME         = L"bulk_extractor";
 static const wchar_t* VERSION      = L"0.5.0-beta";
 static const wchar_t* DESCRIPTION  = L"Run bulk_extractor on an image, path, or selected items; ingest results.";
-static const wchar_t* REPORT_TABLE_SCANNED = L"bulk_extractor scanned";
-static const wchar_t* REPORT_TABLE_HITS    = L"bulk_extractor hits";
+static const wchar_t* REPORT_TABLE_SCANNED = L"BE scanned";   // v0.5.0: short "BE" label names
+static const wchar_t* REPORT_TABLE_HITS    = L"BE hits";
+static const wchar_t* REPORT_TABLE_PREFIX  = L"BE: ";         // per-scanner: "BE: email", "BE: net", ...
 
 // Per project convention: VERBOSE on during development. Flip before sharing.
 static constexpr bool VERBOSE = true;
@@ -972,9 +973,9 @@ struct Settings {
     std::vector<bool> scannerOn;             // parallel to kScanners; size == kNumScanners
     bool         addToCase       = true;
     bool         openFolder      = false;
-    bool         tagScanned      = true;   // every successfully exported item -> "bulk_extractor scanned"
-    bool         tagHits         = true;   // subset with feature hits          -> "bulk_extractor hits"
-    bool         tagHitsPerFeature = false; // v0.2.11: extra labels per-feature -> "bulk_extractor: <name>"
+    bool         tagScanned      = true;   // every successfully exported item -> "BE scanned"
+    bool         tagHits         = true;   // items with feature hits -> per-scanner "BE: <scanner>" labels
+    bool         tagHitsUmbrella = false;  // v0.5.0: sub-option: also one umbrella "BE hits" label
     bool         keepTempDir     = false;  // v0.2.4: keep selected-items temp dir after BE-success
     // v0.3.0: WSL bulk_extractor support.
     bool         useWsl          = false;  // run BE via WSL instead of native Windows binary
@@ -1268,9 +1269,9 @@ static void UpdateInputState(HWND hDlg, const Settings* s) {
     // Per-feature sub-option: only meaningful when TAG_HITS is both enabled
     // (selected-items mode) AND checked.
     bool hitsChecked = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_HITS) == BST_CHECKED;
-    EnableWindow(GetDlgItem(hDlg, IDC_CHK_TAG_HITS_PER_FEATURE), isSelected && hitsChecked);
+    EnableWindow(GetDlgItem(hDlg, IDC_CHK_TAG_HITS_UMBRELLA), isSelected && hitsChecked);
     if (!(isSelected && hitsChecked)) {
-        CheckDlgButton(hDlg, IDC_CHK_TAG_HITS_PER_FEATURE, BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_CHK_TAG_HITS_UMBRELLA, BST_UNCHECKED);
     }
 
     // Disable radios that aren't applicable in this invocation context.
@@ -1294,7 +1295,7 @@ static const int kRunLockIds[] = {
     IDC_COMBO_THREADS, IDC_EDIT_MAXRECURSE,
     IDC_BTN_RESET_SCANNERS, IDC_BTN_TOGGLE_ALL,
     IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
-    IDC_CHK_TAG_SCANNED, IDC_CHK_TAG_HITS, IDC_CHK_TAG_HITS_PER_FEATURE,
+    IDC_CHK_TAG_SCANNED, IDC_CHK_TAG_HITS, IDC_CHK_TAG_HITS_UMBRELLA,
 };
 
 // Forward declaration — definition lives after the split run phases (the
@@ -1449,13 +1450,14 @@ static void InstallDlgTooltips(HWND hDlg) {
           L"Export the items selected in the directory browser to a temp folder and scan that. "
           L"Only available when the X-Tension is invoked from a right-click selection." },
         { IDC_CHK_TAG_SCANNED,
-          L"Label every successfully exported item \"bulk_extractor scanned\", so even partial runs "
-          L"leave an audit trail." },
+          L"Label every successfully exported item \"BE scanned\", so even partial runs leave an "
+          L"audit trail." },
         { IDC_CHK_TAG_HITS,
-          L"Label items where bulk_extractor found at least one feature \"bulk_extractor hits\"." },
-        { IDC_CHK_TAG_HITS_PER_FEATURE,
-          L"Also add one label per scanner that hit, e.g. \"bulk_extractor: email\", "
-          L"\"bulk_extractor: net\"." },
+          L"Label each item with one label per scanner that hit it \u2014 \"BE: email\", \"BE: net\", "
+          L"\"BE: vin\" \u2014 matching the Scanners checklist." },
+        { IDC_CHK_TAG_HITS_UMBRELLA,
+          L"Also add a single umbrella \"BE hits\" label to every item with any hit \u2014 handy as a "
+          L"one-click filter on big cases." },
         { IDC_STATIC_WSL_VERSION,
           L"Version of the binary a Run would use, probed via --version." },
         { IDC_STATIC_SCAN_TARGET,
@@ -1716,7 +1718,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         CheckDlgButton(hDlg, IDC_CHK_OPEN_FOLDER, s->openFolder ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_CHK_TAG_SCANNED, s->tagScanned ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_CHK_TAG_HITS,    s->tagHits    ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_CHK_TAG_HITS_PER_FEATURE, s->tagHitsPerFeature ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_CHK_TAG_HITS_UMBRELLA, s->tagHitsUmbrella ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_CHK_USE_WSL, s->useWsl ? BST_CHECKED : BST_UNCHECKED);
 
         // v0.3.0: WSL detection drives the "Run via WSL" checkbox enablement
@@ -2390,7 +2392,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             s->openFolder = IsDlgButtonChecked(hDlg, IDC_CHK_OPEN_FOLDER) == BST_CHECKED;
             s->tagScanned = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_SCANNED) == BST_CHECKED;
             s->tagHits    = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_HITS)    == BST_CHECKED;
-            s->tagHitsPerFeature = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_HITS_PER_FEATURE) == BST_CHECKED;
+            s->tagHitsUmbrella = IsDlgButtonChecked(hDlg, IDC_CHK_TAG_HITS_UMBRELLA) == BST_CHECKED;
 
             // Validate output dir is non-empty (other validation happens later
             // — we want the user to see "you forgot the output dir" not just
@@ -3401,10 +3403,11 @@ static void PostProcessRun(const Settings& s, const RunPrep& prep,
 
     if (beRanOk && s.tagHits && s.inputMode == InputMode::SelectedItems) {
         FeatureHits fh = CollectHitsByFeature(s.outputDir);
-        // 1) Always (when tagHits) apply the umbrella "bulk_extractor hits"
-        //    label to every item with at least one hit in any feature.
+        // 1) v0.5.0: the umbrella "BE hits" label is now the OPTIONAL part
+        //    (sub-checkbox) — applied to every item with at least one hit in
+        //    any feature when the analyst asks for a single catch-all label.
         UINT64 tagged = 0;
-        if (XWF_Label || XWF_AddToReportTable) {
+        if (s.tagHitsUmbrella && (XWF_Label || XWF_AddToReportTable)) {
             for (LONG id : fh.union_) {
                 if (XWF_Label ? XWF_Label(id, REPORT_TABLE_HITS,
                                           REPORT_TABLE_FLAG_CREATED_BY_APP)
@@ -3416,17 +3419,22 @@ static void PostProcessRun(const Settings& s, const RunPrep& prep,
         }
         if (tagged > 0 && outDidMutate) *outDidMutate = true;
         wchar_t buf[200];
-        swprintf_s(buf,
-            L"feature-file scan: %zu source item(s) had hits; tagged %llu with \"%s\"",
-            fh.union_.size(), (unsigned long long)tagged, REPORT_TABLE_HITS);
+        if (s.tagHitsUmbrella) {
+            swprintf_s(buf,
+                L"feature-file scan: %zu source item(s) had hits; labeled %llu with \"%s\"",
+                fh.union_.size(), (unsigned long long)tagged, REPORT_TABLE_HITS);
+        } else {
+            swprintf_s(buf, L"feature-file scan: %zu source item(s) had hits",
+                       fh.union_.size());
+        }
         Log(buf);
 
-        // 2) v0.2.11 sub-option (refined v0.2.13): apply per-scanner labels in
-        //    addition to the umbrella label. Aggregate the per-feature map into
+        // 2) Per-scanner labels — the PRIMARY hit labels since v0.5.0 (were a
+        //    sub-option in v0.2.11-v0.4.x). Aggregate the per-feature map into
         //    a per-scanner map via FeatureToScanner — url.txt, domain.txt, ip.txt
         //    etc. all collapse to the `net` scanner so the analyst sees Labels
-        //    like "bulk_extractor: net" that match the Scanners checklist.
-        if (s.tagHitsPerFeature && (XWF_Label || XWF_AddToReportTable) && !fh.byFeature.empty()) {
+        //    like "BE: net" that match the Scanners checklist.
+        if ((XWF_Label || XWF_AddToReportTable) && !fh.byFeature.empty()) {
             std::unordered_map<std::wstring, std::unordered_set<LONG>> byScanner;
             for (const auto& kv : fh.byFeature) {
                 std::wstring scanner = FeatureToScanner(kv.first);
@@ -3443,7 +3451,7 @@ static void PostProcessRun(const Settings& s, const RunPrep& prep,
             UINT64 perScannerLabels = 0;
             UINT64 perScannerApplications = 0;
             for (const std::wstring& scanner : scanners) {
-                std::wstring label = L"bulk_extractor: " + scanner;
+                std::wstring label = std::wstring(REPORT_TABLE_PREFIX) + scanner;
                 UINT64 thisCount = 0;
                 for (LONG id : byScanner[scanner]) {
                     if (XWF_Label ? XWF_Label(id, label.c_str(),
@@ -3463,7 +3471,7 @@ static void PostProcessRun(const Settings& s, const RunPrep& prep,
                 }
             }
             swprintf_s(buf,
-                L"per-scanner tagging: %llu label(s) applied across %llu item(s)",
+                L"per-scanner labeling: %llu label(s) applied across %llu item(s)",
                 (unsigned long long)perScannerLabels,
                 (unsigned long long)perScannerApplications);
             Log(buf);

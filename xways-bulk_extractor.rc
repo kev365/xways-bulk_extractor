@@ -59,12 +59,15 @@ BEGIN
     LTEXT           "",                                                 IDC_STATIC_SELECTED_COUNT,196, 112, 190,  10
 
     // Tag sub-options -- only meaningful with "Use selected items..." radio.
-    AUTOCHECKBOX    "Tag scanned source items as ""bulk_extractor scanned""",
+    // v0.5.0: "Label" wording (X-Ways' term), short "BE" names, and the
+    // per-scanner labels are the primary hit labels — the umbrella "BE hits"
+    // is the optional sub-option.
+    AUTOCHECKBOX    "Label scanned source items ""BE scanned""",
                                                                         IDC_CHK_TAG_SCANNED,       24, 128, 360,  10
-    AUTOCHECKBOX    "Tag items with feature hits as ""bulk_extractor hits""",
+    AUTOCHECKBOX    "Label items with feature hits per scanner (""BE: email"", ""BE: net"", ...)",
                                                                         IDC_CHK_TAG_HITS,          24, 142, 360,  10
-    AUTOCHECKBOX    "Also tag with per-scanner labels (e.g., ""bulk_extractor: net"", ""bulk_extractor: email"")",
-                                                                        IDC_CHK_TAG_HITS_PER_FEATURE, 34, 156, 350, 10
+    AUTOCHECKBOX    "Also add one umbrella ""BE hits"" label to every item with any hit",
+                                                                        IDC_CHK_TAG_HITS_UMBRELLA, 34, 156, 350, 10
 
     // v0.5.0: what a Run will actually feed to bulk_extractor, with size
     // (file: name + size; directory: name + bounded file count + size;
