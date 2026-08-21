@@ -49,6 +49,8 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <commctrl.h>
+#include <uxtheme.h>
+#include <vssym32.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -2025,6 +2027,22 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
     }
     case WM_TIMER: {
         if (wp == kCtrlPollTimerId) {
+            // v0.5.0: owner-drawn Run/Cancel don't get the theme's automatic
+            // hot-tracking, so poll the cursor and repaint on hover changes.
+            {
+                static bool s_hot[2] = { false, false };
+                const int ids[2] = { IDOK, IDCANCEL };
+                POINT pt; GetCursorPos(&pt);
+                HWND under = WindowFromPoint(pt);
+                for (int i = 0; i < 2; ++i) {
+                    HWND h = GetDlgItem(hDlg, ids[i]);
+                    bool hot = h && under == h;
+                    if (hot != s_hot[i]) {
+                        s_hot[i] = hot;
+                        if (h) InvalidateRect(h, nullptr, TRUE);
+                    }
+                }
+            }
             if (g_workerActive.load()) return TRUE;   // Ctrl-to-save inert during a run
             bool nowDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (nowDown != g_runCtrlDown) {
@@ -2084,6 +2102,41 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         bool pressed  = (dis->itemState & ODS_SELECTED) != 0;
         bool disabled = (dis->itemState & ODS_DISABLED) != 0;
         bool focused  = (dis->itemState & ODS_FOCUS) != 0;
+        bool isDef    = (dis->itemState & ODS_DEFAULT) != 0;
+        bool hot      = false;
+        {
+            POINT pt; GetCursorPos(&pt);
+            hot = WindowFromPoint(pt) == dis->hwndItem;
+        }
+
+        // v0.5.0: when not showing the Ctrl "Save" tint, paint with the real
+        // BUTTON theme so Run/Cancel get the same hover/pressed/default look
+        // as the non-owner-drawn buttons beside them. Falls through to the
+        // classic DrawEdge rendering only when themes are unavailable.
+        if (!ctrl) {
+            HTHEME th = OpenThemeData(dis->hwndItem, L"BUTTON");
+            if (th) {
+                int state = disabled ? PBS_DISABLED
+                          : pressed  ? PBS_PRESSED
+                          : hot      ? PBS_HOT
+                          : isDef    ? PBS_DEFAULTED
+                                     : PBS_NORMAL;
+                if (IsThemeBackgroundPartiallyTransparent(th, BP_PUSHBUTTON, state))
+                    DrawThemeParentBackground(dis->hwndItem, dis->hDC, &dis->rcItem);
+                DrawThemeBackground(th, dis->hDC, BP_PUSHBUTTON, state, &dis->rcItem, nullptr);
+                wchar_t ttxt[64] = {0};
+                GetWindowTextW(dis->hwndItem, ttxt, 64);
+                DrawThemeText(th, dis->hDC, BP_PUSHBUTTON, state, ttxt, -1,
+                              DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0, &dis->rcItem);
+                CloseThemeData(th);
+                if (focused) {
+                    RECT rcFocus = dis->rcItem;
+                    InflateRect(&rcFocus, -3, -3);
+                    DrawFocusRect(dis->hDC, &rcFocus);
+                }
+                return TRUE;
+            }
+        }
 
         COLORREF bg;
         if (disabled)     bg = GetSysColor(COLOR_BTNFACE);
