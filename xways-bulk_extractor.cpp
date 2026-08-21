@@ -2176,6 +2176,12 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         case IDC_RADIO_INPUT_EVOIMAGE:
         case IDC_RADIO_INPUT_PICK:
         case IDC_RADIO_INPUT_SELECTED:
+            // v0.5.0: enforce exclusivity ourselves. The auto-radio sibling
+            // walk depends on template ordering / WS_GROUP bounds and left two
+            // radios checked after the layout reflow; CheckRadioButton makes
+            // the mode independent of that.
+            if (evt == BN_CLICKED)
+                CheckRadioButton(hDlg, IDC_RADIO_INPUT_EVOIMAGE, IDC_RADIO_INPUT_SELECTED, id);
             UpdateInputState(hDlg, s);
             return TRUE;
 

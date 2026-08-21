@@ -78,7 +78,8 @@ BEGIN
     // everything below shifts up (kShiftIds). Threads / Max recursion have
     // placeholder y here and are snapped to sit directly above the Output
     // handling group after the auto-fit.
-    GROUPBOX        "Scanners",                                         IDC_GROUP_SCANNERS,         7, 197, 283, 196
+    // WS_GROUP closes the input-source radio group (radio1 opened it).
+    GROUPBOX        "Scanners",                                         IDC_GROUP_SCANNERS,         7, 197, 283, 196, WS_GROUP
     PUSHBUTTON      "Reset to defaults",                                IDC_BTN_RESET_SCANNERS,   297, 209,  96,  16
     PUSHBUTTON      "Check / Uncheck all",                              IDC_BTN_TOGGLE_ALL,       297, 229,  96,  16
     LTEXT           "Threads:",                                         IDC_LABEL_THREADS,        297, 255,  50,   8
