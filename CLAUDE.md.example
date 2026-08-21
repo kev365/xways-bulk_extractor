@@ -20,7 +20,7 @@ selected items) and three output integrations (add output dir to the case via
 - **Version:** `0.5.0-beta` — keep `VERSION` in the `.cpp`, the `.rc`
   VERSIONINFO, and the README in lockstep (versioning convention).
 - **Identity constants** (top of `xways-bulk_extractor.cpp`): `NAME`,
-  `VERSION`, `DESCRIPTION`, `REPORT_TABLE_HITS`, `REPORT_TABLE_SCANNED`.
+  `VERSION`, `DESCRIPTION`, `REPORT_TABLE_SCANNED`, `REPORT_TABLE_PREFIX`.
 
 ## Build
 

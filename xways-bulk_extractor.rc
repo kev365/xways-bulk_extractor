@@ -29,7 +29,7 @@
 //
 // v0.2.7+: dialog font 10pt for non-scanner controls; scanner checkboxes
 // programmatically created with their own 9pt font for density.
-IDD_SETTINGS DIALOGEX 0, 0, 400, 512
+IDD_SETTINGS DIALOGEX 0, 0, 400, 498
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "bulk_extractor - Settings"
 FONT 10, "MS Shell Dlg"
@@ -47,7 +47,7 @@ BEGIN
     PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_BE,        336,  30,  47,  14
 
     // -------- Input source group (with tagging sub-options nested) --------
-    GROUPBOX        "Input source",                                     IDC_GROUP_INPUT,            7,  58, 386, 131
+    GROUPBOX        "Input source",                                     IDC_GROUP_INPUT,            7,  58, 386, 117
     AUTORADIOBUTTON "&Active evidence object's source image",           IDC_RADIO_INPUT_EVOIMAGE,  14,  70, 180,  10, WS_GROUP | WS_TABSTOP
     LTEXT           "",                                                 IDC_STATIC_EO_HINT,       196,  70, 190,  10
     AUTORADIOBUTTON "&External file or directory (exported data or data not in the case):",
@@ -59,21 +59,18 @@ BEGIN
     LTEXT           "",                                                 IDC_STATIC_SELECTED_COUNT,196, 112, 190,  10
 
     // Tag sub-options -- only meaningful with "Use selected items..." radio.
-    // v0.5.0: "Label" wording (X-Ways' term), short "BE" names, and the
-    // per-scanner labels are the primary hit labels — the umbrella "BE hits"
-    // is the optional sub-option.
+    // v0.5.0: "Label" wording (X-Ways' term), short "BE" names; per-scanner
+    // labels are the hit labels (the old umbrella label was dropped).
     AUTOCHECKBOX    "Label scanned source items ""BE scanned""",
                                                                         IDC_CHK_TAG_SCANNED,       24, 128, 360,  10
     AUTOCHECKBOX    "Label items with feature hits per scanner (""BE: email"", ""BE: net"", ...)",
                                                                         IDC_CHK_TAG_HITS,          24, 142, 360,  10
-    AUTOCHECKBOX    "Also add one umbrella ""BE hits"" label to every item with any hit",
-                                                                        IDC_CHK_TAG_HITS_UMBRELLA, 34, 156, 350, 10
 
     // v0.5.0: what a Run will actually feed to bulk_extractor, with size
     // (file: name + size; directory: name + bounded file count + size;
     // selected items: count + total size). Refreshed by UpdateScanTarget.
-    LTEXT           "Scan target:",                                     IDC_LABEL_SCAN_TARGET,     14, 173,  48,   8
-    LTEXT           "",                                                 IDC_STATIC_SCAN_TARGET,    64, 173, 322,   8, SS_NOTIFY
+    LTEXT           "Scan target:",                                     IDC_LABEL_SCAN_TARGET,     14, 159,  48,   8
+    LTEXT           "",                                                 IDC_STATIC_SCAN_TARGET,    64, 159, 322,   8, SS_NOTIFY
 
     // -------- Scanners group + right column --------
     // Checkboxes are created programmatically (4 columns, column-major,
@@ -82,33 +79,33 @@ BEGIN
     // placeholder y here and are snapped to sit directly above the Output
     // handling group after the auto-fit.
     // WS_GROUP closes the input-source radio group (radio1 opened it).
-    GROUPBOX        "Scanners",                                         IDC_GROUP_SCANNERS,         7, 197, 283, 196, WS_GROUP
-    PUSHBUTTON      "Reset to defaults",                                IDC_BTN_RESET_SCANNERS,   297, 209,  96,  16
-    PUSHBUTTON      "Check / Uncheck all",                              IDC_BTN_TOGGLE_ALL,       297, 229,  96,  16
-    LTEXT           "Threads:",                                         IDC_LABEL_THREADS,        297, 255,  50,   8
-    COMBOBOX                                                            IDC_COMBO_THREADS,        350, 253,  43, 200, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Max recursion:",                                   IDC_LABEL_MAXRECURSE,     297, 271,  55,   8
-    EDITTEXT                                                            IDC_EDIT_MAXRECURSE,      355, 269,  38,  12, ES_AUTOHSCROLL | ES_NUMBER
+    GROUPBOX        "Scanners",                                         IDC_GROUP_SCANNERS,         7, 183, 283, 196, WS_GROUP
+    PUSHBUTTON      "Reset to defaults",                                IDC_BTN_RESET_SCANNERS,   297, 195,  96,  16
+    PUSHBUTTON      "Check / Uncheck all",                              IDC_BTN_TOGGLE_ALL,       297, 215,  96,  16
+    LTEXT           "Threads:",                                         IDC_LABEL_THREADS,        297, 241,  50,   8
+    COMBOBOX                                                            IDC_COMBO_THREADS,        350, 239,  43, 200, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Max recursion:",                                   IDC_LABEL_MAXRECURSE,     297, 257,  55,   8
+    EDITTEXT                                                            IDC_EDIT_MAXRECURSE,      355, 255,  38,  12, ES_AUTOHSCROLL | ES_NUMBER
 
     // -------- Output handling (full width) --------
-    GROUPBOX        "Output handling",                                  IDC_GROUP_OUTPUT,           7, 401, 386,  72
-    LTEXT           "Output directory:",                                IDC_LABEL_OUTPUT,          14, 415,  80,   8
-    EDITTEXT                                                            IDC_EDIT_OUTPUT_DIR,       14, 425, 318,  12, ES_AUTOHSCROLL
-    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_OUTPUT,    336, 424,  47,  14
+    GROUPBOX        "Output handling",                                  IDC_GROUP_OUTPUT,           7, 387, 386,  72
+    LTEXT           "Output directory:",                                IDC_LABEL_OUTPUT,          14, 401,  80,   8
+    EDITTEXT                                                            IDC_EDIT_OUTPUT_DIR,       14, 411, 318,  12, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_OUTPUT,    336, 410,  47,  14
     AUTOCHECKBOX    "Add output directory to X-Ways case as evidence object (Directory)",
-                                                                        IDC_CHK_ADD_TO_CASE,       14, 445, 366,  10
-    AUTOCHECKBOX    "Open output folder in Explorer when done",         IDC_CHK_OPEN_FOLDER,       14, 459, 366,  10
+                                                                        IDC_CHK_ADD_TO_CASE,       14, 431, 366,  10
+    AUTOCHECKBOX    "Open output folder in Explorer when done",         IDC_CHK_OPEN_FOLDER,       14, 445, 366,  10
 
     // -------- Bottom: status/progress bar, then About / Open output | Run / Cancel
     // The status bar is owner-drawn (DrawStatusBar): idle track, marquee
     // while running, soft fill when done, red flash on helper rejection.
     // Run/Cancel are owner-draw for the Ctrl-to-save gesture (DM_SETDEFID
     // keeps Enter on Run).
-    CONTROL         "",                                                 IDC_STATIC_BE_STATUS,     "Static", SS_OWNERDRAW | SS_NOTIFY | WS_CHILD | WS_VISIBLE, 7, 478, 386, 12
-    PUSHBUTTON      "About",                                            IDC_BTN_ABOUT,              7, 494,  45,  14
-    PUSHBUTTON      "Open output",                                      IDC_BTN_OPEN_OUTPUT,       56, 494,  60,  14
-    PUSHBUTTON      "Run",                                              IDOK,                     283, 494,  50,  14, BS_OWNERDRAW
-    PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 494,  50,  14, BS_OWNERDRAW
+    CONTROL         "",                                                 IDC_STATIC_BE_STATUS,     "Static", SS_OWNERDRAW | SS_NOTIFY | WS_CHILD | WS_VISIBLE, 7, 464, 386, 12
+    PUSHBUTTON      "About",                                            IDC_BTN_ABOUT,              7, 480,  45,  14
+    PUSHBUTTON      "Open output",                                      IDC_BTN_OPEN_OUTPUT,       56, 480,  60,  14
+    PUSHBUTTON      "Run",                                              IDOK,                     283, 480,  50,  14, BS_OWNERDRAW
+    PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 480,  50,  14, BS_OWNERDRAW
 END
 
 // =============================================================================
