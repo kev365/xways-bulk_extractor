@@ -296,6 +296,16 @@ struct WslInfo {
     std::wstring be_version;
 };
 static const WslInfo& DetectWslOnce();
+// v0.5.0: WSL detection runs on a background thread started in XT_Init (pure
+// Win32 process probes — no XWF_* calls) because a *stopped* WSL distro takes
+// 5-10 s to cold-start and used to either stall the dialog or time out and
+// report "not found". The dialog reads the result once g_wslDetectDone is
+// set (polled by the 100 ms timer); until then the WSL checkbox is disabled
+// and the readout says "detecting". Joined in XT_Done. DetectWslOnce() must
+// only ever be called from that thread or after g_wslDetectDone.
+static std::atomic<bool> g_wslDetectDone{false};
+static std::thread       g_wslDetectThread;
+static bool              g_wslUiApplied = false;   // per dialog instance
 static std::wstring   WindowsPathToWsl(const std::wstring& win);
 static std::wstring   WslUncToLinuxPath(const std::wstring& win);
 
@@ -1310,7 +1320,8 @@ static void UpdateScanTarget(HWND hDlg) {
         text = WithCommas(files) + (files == 1 ? L" file" : L" files") + L" \u2014 " + HumanSize(bytes);
         std::wstring extra;
         if (dirs > 0)  extra += L"skipping " + WithCommas(dirs) + (dirs == 1 ? L" directory" : L" directories");
-        if (empty > 0) extra += (extra.empty() ? L"skipping " : L", ") + WithCommas(empty) + L" empty";
+        if (empty > 0) extra += (extra.empty() ? L"skipping " : L", ") + WithCommas(empty) +
+                                (empty == 1 ? L" empty file" : L" empty files");
         if (children > 0) {
             if (!extra.empty()) extra += L"; ";
             extra += WithCommas(children) + L" child object" + (children == 1 ? L"" : L"s") + L" of files included";
@@ -1382,6 +1393,10 @@ static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& nativePath)
     wchar_t verBuf[160] = {0};
     bool wslMode = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
     if (wslMode) {
+        if (!g_wslDetectDone.load()) {
+            SetDlgItemTextW(hDlg, IDC_STATIC_WSL_VERSION, L"WSL: detecting\u2026");
+            return;
+        }
         const WslInfo& wsl = DetectWslOnce();
         if      (!wsl.wsl_present)   wcscpy_s(verBuf, L"WSL not detected");
         else if (!wsl.be_available)  wcscpy_s(verBuf, L"bulk_extractor not found in WSL");
@@ -1405,6 +1420,25 @@ static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& nativePath)
         }
     }
     SetDlgItemTextW(hDlg, IDC_STATIC_WSL_VERSION, verBuf);
+}
+
+// v0.5.0: apply the (finished) background WSL detection to the dialog: enable
+// the checkbox when WSL + a Linux bulk_extractor exist, fill the Linux path
+// if the cfg didn't pin one, defensively unset a WSL default that can't
+// work, and refresh the readout. Idempotent; runs once per dialog instance.
+static void ApplyWslDetectionToDialog(HWND hDlg, Settings* s) {
+    if (!s || g_wslUiApplied || !g_wslDetectDone.load()) return;
+    g_wslUiApplied = true;
+    const WslInfo& wsl = DetectWslOnce();
+    const BOOL canUseWsl = wsl.wsl_present && wsl.be_available;
+    EnableWindow(GetDlgItem(hDlg, IDC_CHK_USE_WSL), canUseWsl);
+    if (canUseWsl && TrimW(s->wslBeBinary).empty()) s->wslBeBinary = wsl.be_path;
+    if (!canUseWsl && s->useWsl) {
+        s->useWsl = false;
+        CheckDlgButton(hDlg, IDC_CHK_USE_WSL, BST_UNCHECKED);
+        SetDlgItemTextW(hDlg, IDC_EDIT_BE_BIN, s->beBinary.c_str());
+    }
+    UpdateBinaryStatusReadout(hDlg, s->beBinary);
 }
 
 // v0.5.0: paint the bottom status/progress bar (IDC_STATIC_BE_STATUS,
@@ -1791,19 +1825,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         // + adjacent version readout. RunFlow has already populated
         // s->wslBeBinary from detection (or sidecar override) before
         // showing the dialog, so this block only handles the UI state.
-        {
-            const WslInfo& wsl = DetectWslOnce();
-            BOOL canUseWsl = wsl.wsl_present && wsl.be_available;
-            EnableWindow(GetDlgItem(hDlg, IDC_CHK_USE_WSL), canUseWsl);
-            // If WSL isn't usable, defensively unset the useWsl flag so
-            // the BE-binary edit doesn't show the (now-meaningless) Linux
-            // path.
-            if (!canUseWsl && s->useWsl) {
-                CheckDlgButton(hDlg, IDC_CHK_USE_WSL, BST_UNCHECKED);
-                SetDlgItemTextW(hDlg, IDC_EDIT_BE_BIN, s->beBinary.c_str());
-            }
-            // v0.5.0: readout follows the mode actually in effect (after the
-            // defensive unset) — native shows the Windows binary's version.
+        // v0.5.0: WSL detection runs in the background (see g_wslDetectThread).
+        // Apply it now if it already finished, otherwise the checkbox stays
+        // disabled and the 100 ms timer applies it when it lands.
+        g_wslUiApplied = false;
+        EnableWindow(GetDlgItem(hDlg, IDC_CHK_USE_WSL), FALSE);
+        if (g_wslDetectDone.load()) {
+            ApplyWslDetectionToDialog(hDlg, s);
+        } else {
             UpdateBinaryStatusReadout(hDlg, s->beBinary);
         }
 
@@ -2097,6 +2126,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
     }
     case WM_TIMER: {
         if (wp == kCtrlPollTimerId) {
+            // v0.5.0: background WSL detection landed -> enable/refresh.
+            if (!g_wslUiApplied && g_wslDetectDone.load()) ApplyWslDetectionToDialog(hDlg, s);
             // v0.5.0: owner-drawn Run/Cancel don't get the theme's automatic
             // hot-tracking, so poll the cursor and repaint on hover changes.
             {
@@ -2777,7 +2808,7 @@ static const WslInfo& DetectWslOnce() {
     // Step 2: bulk_extractor in PATH inside WSL?
     std::wstring whichPath;
     {
-        DWORD rv = RunCaptureStdout(L"wsl.exe -e which bulk_extractor", whichPath, 4000);
+        DWORD rv = RunCaptureStdout(L"wsl.exe -e which bulk_extractor", whichPath, 25000);   // v0.5.0: cold-start headroom (background)
         if (rv == 0) {
             // Strip trailing whitespace/newlines.
             while (!whichPath.empty() &&
@@ -2802,7 +2833,7 @@ static const WslInfo& DetectWslOnce() {
     // contains a '.' (the version number itself).
     {
         std::wstring out;
-        DWORD rv = RunCaptureStdout(L"wsl.exe -e bulk_extractor -V", out, 4000);
+        DWORD rv = RunCaptureStdout(L"wsl.exe -e bulk_extractor -V", out, 25000);
         if (rv == 0 && !out.empty()) {
             size_t s = std::wstring::npos;
             size_t p = out.find(L" version ");
@@ -2924,10 +2955,15 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
         cmd = QuoteIfNeeded(s.beBinary);
     }
 
-    // v0.5.0: native mode passes 8.3 short paths (see ShortPathForCmdline) so
-    // BE's path-embedding carved-file names stay under MAX_PATH. Everything
-    // on our side (evidence object, labels, Open output) keeps the long path.
-    const std::wstring outArg = wsl ? pathArg(s.outputDir) : ShortPathForCmdline(s.outputDir);
+    // v0.5.0: for DIRECTORY inputs in native mode, pass 8.3 short paths (see
+    // ShortPathForCmdline) so BE's path-embedding carved-file names stay under
+    // MAX_PATH. Single-file inputs (images) don't embed the path, so they keep
+    // the readable long paths. Everything on our side (evidence object,
+    // labels, Open output) always keeps the long path.
+    const bool isDir = DirExists(inputPath);
+    const bool shortPaths = !wsl && isDir;
+    const std::wstring outArg = wsl ? pathArg(s.outputDir)
+                              : shortPaths ? ShortPathForCmdline(s.outputDir) : s.outputDir;
     cmd += L" -o ";
     cmd += QuoteIfNeeded(outArg);
 
@@ -2953,21 +2989,20 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
         if (!want &&  def) { cmd += L" -x "; cmd += kScanners[i].name; }
     }
 
-    // BE wants `-R` only for directory-as-input scans. Detect by checking
-    // whether the input is a directory (Windows-side check; same answer
-    // either way).
-    bool isDir = DirExists(inputPath);
+    // BE wants `-R` only for directory-as-input scans (Windows-side check;
+    // same answer either way).
     if (isDir) cmd += L" -R";
 
-    const std::wstring inArg = wsl ? pathArg(inputPath) : ShortPathForCmdline(inputPath);
+    const std::wstring inArg = wsl ? pathArg(inputPath)
+                             : shortPaths ? ShortPathForCmdline(inputPath) : inputPath;
     cmd += L" ";
     cmd += QuoteIfNeeded(inArg);
 
     Log(L"command: " + cmd);
-    if (!wsl && (outArg != s.outputDir || inArg != inputPath)) {
-        Log(L"(paths passed to bulk_extractor in 8.3 short form: its carved-file names embed "
-            L"the full input path on Windows and would exceed MAX_PATH otherwise)");
-    } else if (!wsl && isDir) {
+    if (shortPaths && (outArg != s.outputDir || inArg != inputPath)) {
+        Log(L"(directory scan: paths passed to bulk_extractor in 8.3 short form — its carved-file "
+            L"names embed the full input path on Windows and would exceed MAX_PATH otherwise)");
+    } else if (shortPaths) {
         Log(L"(note: 8.3 short names unavailable on this volume \u2014 long carved-file names "
             L"from a directory scan may exceed MAX_PATH; see README \"Known issues\")");
     }
@@ -3766,18 +3801,25 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
 
     // v0.3.0: WSL BE binary. Sidecar override > detection > empty. The
     // dialog also disables the "Run via WSL" checkbox if detection failed.
+    // v0.5.0: WSL detection may still be running in the background; only
+    // consult it when finished (ApplyWslDetectionToDialog fills the gaps
+    // once it lands).
     if (!cfg.wsl_be_binary.empty()) {
         s.wslBeBinary = cfg.wsl_be_binary;
-    } else {
+    } else if (g_wslDetectDone.load()) {
         const WslInfo& wsl = DetectWslOnce();
         if (wsl.be_available) s.wslBeBinary = wsl.be_path;
     }
     // Default-checked state from sidecar; only honor if WSL is actually
     // available so the dialog doesn't appear pre-checked when it can't
-    // function.
+    // function (unknown yet -> not checked; the analyst can tick it once
+    // detection enables the checkbox).
     {
-        const WslInfo& wsl = DetectWslOnce();
-        s.useWsl = cfg.use_wsl_default && wsl.wsl_present && wsl.be_available;
+        s.useWsl = false;
+        if (cfg.use_wsl_default && g_wslDetectDone.load()) {
+            const WslInfo& wsl = DetectWslOnce();
+            s.useWsl = wsl.wsl_present && wsl.be_available;
+        }
     }
 
     // Output dir: cfg override > suggestion based on case dir.
@@ -3940,6 +3982,14 @@ LONG __stdcall XT_Init(DWORD nVersion, DWORD nFlags, HWND hMainWnd, void*) {
                NAME, VERSION, nVersion / 100.0, missing);
     Log(buf);
     if (!XWF_OutputMessage) return -1;  // bare minimum to be useful
+    // v0.5.0: kick off WSL detection now so it's (usually) done by the time
+    // the dialog opens. Pure Win32 — safe off X-Ways' thread.
+    if (!g_wslDetectThread.joinable()) {
+        g_wslDetectThread = std::thread([]() {
+            DetectWslOnce();
+            g_wslDetectDone.store(true);
+        });
+    }
     return 1;
 }
 
@@ -3987,7 +4037,7 @@ LONG __stdcall XT_Finalize(HANDLE, HANDLE, DWORD nOpType, void*) {
         // to appear on first open (WSL + binary probes) and on big selections.
         Log(L"received " + WithCommas(g_run.selected.size()) +
             L" selected item(s) from X-Ways \u2014 opening the settings dialog "
-            L"(probing the bulk_extractor binary and WSL)\u2026");
+            L"(verifying the bulk_extractor binary)\u2026");
         RunFlow(g_hMainWnd, g_run);
     }
     // 0x02 = ask X-Ways to save the volume snapshot (added v21.3 Preview 3).
@@ -4007,6 +4057,7 @@ LONG __stdcall XT_Done(void*) {
         g_cancelRequested.store(true);
         g_workerThread.join();
     }
+    if (g_wslDetectThread.joinable()) g_wslDetectThread.join();   // v0.5.0
     Log(L"XT_Done");
     return 0;
 }
