@@ -193,6 +193,11 @@ enum : DWORD {
 typedef VOID   (__stdcall *pfn_XWF_OutputMessage)(const wchar_t*, DWORD);
 typedef DWORD  (__stdcall *pfn_XWF_GetItemCount)(LPVOID);
 typedef const wchar_t* (__stdcall *pfn_XWF_GetItemName)(LONG);
+typedef INT64          (__stdcall *pfn_XWF_GetItemInformation)(LONG, LONG, BOOL*);
+// XWF_ITEM_INFO_FLAGS (X-Tension.h: 3) — bit 0x01 = directory. Empirically
+// verified in the skill KB (0x02 is "has child objects", NOT directory).
+static constexpr LONG  XWF_ITEM_INFO_FLAGS          = 3;
+static constexpr INT64 XWF_ITEM_INFO_FLAG_DIRECTORY = 0x00000001;
 typedef LONG   (__stdcall *pfn_XWF_GetItemParent)(LONG);
 typedef INT64  (__stdcall *pfn_XWF_GetItemSize)(LONG);
 typedef VOID   (__stdcall *pfn_XWF_GetVolumeName)(HANDLE, wchar_t*, DWORD);
@@ -212,6 +217,7 @@ typedef VOID   (__stdcall *pfn_XWF_CloseEvObj)(HANDLE);
 static pfn_XWF_OutputMessage    XWF_OutputMessage    = nullptr;
 static pfn_XWF_GetItemCount     XWF_GetItemCount     = nullptr;
 static pfn_XWF_GetItemName      XWF_GetItemName      = nullptr;
+static pfn_XWF_GetItemInformation XWF_GetItemInformation = nullptr;
 static pfn_XWF_GetItemParent    XWF_GetItemParent    = nullptr;
 static pfn_XWF_GetItemSize      XWF_GetItemSize      = nullptr;
 static pfn_XWF_GetVolumeName    XWF_GetVolumeName    = nullptr;
@@ -339,6 +345,7 @@ static int RetrieveFunctionPointers() {
     XWF_OutputMessage    = Resolve<pfn_XWF_OutputMessage   >(h, "XWF_OutputMessage", n);
     XWF_GetItemCount     = Resolve<pfn_XWF_GetItemCount    >(h, "XWF_GetItemCount", n);
     XWF_GetItemName      = Resolve<pfn_XWF_GetItemName     >(h, "XWF_GetItemName", n);
+    XWF_GetItemInformation = Resolve<pfn_XWF_GetItemInformation>(h, "XWF_GetItemInformation", n);
     XWF_GetItemParent    = Resolve<pfn_XWF_GetItemParent   >(h, "XWF_GetItemParent", n);
     XWF_GetItemSize      = Resolve<pfn_XWF_GetItemSize     >(h, "XWF_GetItemSize", n);
     XWF_GetVolumeName    = Resolve<pfn_XWF_GetVolumeName   >(h, "XWF_GetVolumeName", n);
@@ -1190,6 +1197,16 @@ static RunPrep g_workerPrep;  // dialog path: filled by IDOK, read by worker + W
 //   will actually feed to bulk_extractor, and how big it is. Cheap for files
 //   and selected items; directories get a bounded walk (50k files / 1.5 s,
 //   "+" marks a truncated count) so a huge tree can't stall the dialog.
+// v0.5.0: directories show a non-zero size in the snapshot, so a size check
+// alone lets them through to XWF_OpenItem, which fails ("export FAILED" x546
+// on the first big selected-items run). Ask the snapshot flags instead.
+static bool IsDirectoryItem(LONG itemID) {
+    if (!XWF_GetItemInformation) return false;
+    BOOL ok = FALSE;
+    INT64 flags = XWF_GetItemInformation(itemID, XWF_ITEM_INFO_FLAGS, &ok);
+    return ok && (flags & XWF_ITEM_INFO_FLAG_DIRECTORY) != 0;
+}
+
 static std::wstring HumanSize(UINT64 b) {
     static const wchar_t* kUnits[] = { L"bytes", L"KB", L"MB", L"GB", L"TB" };
     double v = (double)b; int i = 0;
@@ -1251,16 +1268,23 @@ static void UpdateScanTarget(HWND hDlg) {
     std::wstring text;
     if (IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_SELECTED) == BST_CHECKED) {
         UINT64 bytes = 0;
-        const size_t n = g_run.selected.size();
-        if (XWF_GetItemSize) {
-            for (LONG id : g_run.selected) {
+        size_t dirs = 0;
+        for (LONG id : g_run.selected) {
+            if (IsDirectoryItem(id)) { ++dirs; continue; }
+            if (XWF_GetItemSize) {
                 INT64 sz = XWF_GetItemSize(id);
                 if (sz > 0) bytes += (UINT64)sz;
             }
         }
-        wchar_t buf[128];
-        swprintf_s(buf, L"%zu selected item%s \u2014 %s",
-                   n, n == 1 ? L"" : L"s", HumanSize(bytes).c_str());
+        const size_t files = g_run.selected.size() - dirs;
+        wchar_t buf[160];
+        if (dirs > 0)
+            swprintf_s(buf, L"%zu selected file%s \u2014 %s  (+ %zu director%s, skipped)",
+                       files, files == 1 ? L"" : L"s", HumanSize(bytes).c_str(),
+                       dirs, dirs == 1 ? L"y" : L"ies");
+        else
+            swprintf_s(buf, L"%zu selected file%s \u2014 %s",
+                       files, files == 1 ? L"" : L"s", HumanSize(bytes).c_str());
         text = buf;
     } else {
         // Active-EO and External modes both run whatever the path field holds
@@ -3122,6 +3146,24 @@ static std::wstring FeatureToScanner(const std::wstring& featureName) {
         {L"xor",                    L"xor"},
         // zip scanner — ZIP archive carving
         {L"zip",                    L"zip"},
+        {L"zip_carved",             L"zip"},
+        // v0.5.0: BE 2.1+/2.2 feature-file names observed live — map the
+        // *_carved twins onto their checklist scanner so an item doesn't get
+        // both "BE: winpe" and "BE: winpe_carved"; fold the exif scanner's
+        // JPEG carve, net's wifi, accts' SIN onto their scanners.
+        {L"ntfsindx_carved",        L"ntfsindx"},
+        {L"ntfslogfile_carved",     L"ntfslogfile"},
+        {L"ntfsmft_carved",         L"ntfsmft"},
+        {L"ntfsusn_carved",         L"ntfsusn"},
+        {L"winpe_carved",           L"winpe"},
+        {L"unrar_carved",           L"rar"},
+        {L"jpeg",                   L"exif"},
+        {L"jpeg_carved",            L"exif"},
+        {L"wifi",                   L"net"},
+        {L"sin",                    L"accts"},
+        // Not scanner hits — BE bookkeeping outputs. Empty scanner = skip.
+        {L"duplicates",             L""},
+        {L"alerts",                 L""},
     };
     for (const auto& m : kMap) {
         if (featureName == m.feature) return m.scanner;
@@ -3199,6 +3241,7 @@ struct ExportResult {
     int          exportFailed   = 0;
     int          virtualSkipped = 0;  // v0.2.4: virtual/unreadable items (e.g. Free space)
     int          taggedScanned  = 0;
+    int          dirsSkipped    = 0;  // v0.5.0: directories in the selection (not exportable)
     UINT64       bytes          = 0;  // v0.5.0: total bytes exported
     bool         cancelled      = false;  // v0.5.0: analyst hit Cancel mid-export
 };
@@ -3225,9 +3268,10 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
         if (progress && (done % 16 == 0 || done == total)) {
             if (!progress(done, total, r.bytes)) { r.cancelled = true; break; }
         }
+        if (IsDirectoryItem(itemID)) { ++r.dirsSkipped; continue; }   // v0.5.0
         if (!XWF_GetItemSize) continue;
         INT64 sz = XWF_GetItemSize(itemID);
-        if (sz <= 0) continue;  // skip empty/dir/unknown
+        if (sz <= 0) continue;  // skip empty/unknown
 
         const wchar_t* nm = XWF_GetItemName ? XWF_GetItemName(itemID) : L"";
         std::wstring leaf = SanitizeForFilename(nm ? nm : L"");
@@ -3361,6 +3405,12 @@ static bool PrepareRunInput(const RunCtx& ctx, const Settings& s, RunPrep& prep)
         swprintf_s(buf, L"exported %d item(s), %s, to %s",
                    er.exported, HumanSize(er.bytes).c_str(), er.tempDir.c_str());
         Log(buf);
+        if (er.dirsSkipped > 0) {
+            swprintf_s(buf, L"  (%d director%s in the selection skipped \u2014 bulk_extractor "
+                            L"scans their files, not the folder entries)",
+                       er.dirsSkipped, er.dirsSkipped == 1 ? L"y" : L"ies");
+            Log(buf);
+        }
         if (er.exportFailed > 0) {
             swprintf_s(buf, L"  (%d failed to export)", er.exportFailed);
             Log(buf);
