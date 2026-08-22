@@ -296,6 +296,7 @@ struct WslInfo {
     std::wstring be_version;
 };
 static const WslInfo& DetectWslOnce();
+static DWORD RunCaptureStdout(const std::wstring& cmd, std::wstring& out, DWORD timeoutMs, BOOL* pTimedOut);
 // v0.5.0: WSL detection runs on a background thread started in XT_Init (pure
 // Win32 process probes — no XWF_* calls) because a *stopped* WSL distro takes
 // 5-10 s to cold-start and used to either stall the dialog or time out and
@@ -1389,22 +1390,53 @@ static void OpenInExplorer(const std::wstring& path);
 // describes the binary a Run would actually use. Native mode probes the
 // exe's `--version` banner (cached per path — the probe spawns a process);
 // WSL mode shows the one-time WSL detection status, as before.
-static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& nativePath) {
-    wchar_t verBuf[160] = {0};
+// v0.5.0: probe a Linux binary's version through WSL: `wsl.exe -e <path> -V`,
+// first non-empty line (e.g. "bulk_extractor 2.2.0"). Cached per path — the
+// probe spawns wsl.exe (the distro is warm after detection; 15 s cap).
+static std::wstring ProbeWslBinaryBanner(const std::wstring& linuxPath) {
+    static std::wstring s_cachePath, s_cacheBanner;
+    if (linuxPath == s_cachePath) return s_cacheBanner;
+    s_cachePath = linuxPath; s_cacheBanner.clear();
+    std::wstring out;
+    DWORD rv = RunCaptureStdout(L"wsl.exe -e \"" + linuxPath + L"\" -V", out, 15000, nullptr);
+    if (rv == 0) {
+        std::wistringstream is(out);
+        std::wstring line;
+        while (std::getline(is, line)) {
+            line = TrimW(line);
+            if (!line.empty()) { s_cacheBanner = line; break; }
+        }
+    }
+    return s_cacheBanner;
+}
+
+// v0.5.0: the readout always describes the binary named IN THE FIELD for the
+// current mode — native: `<exe> --version`; WSL: `wsl -e <path> -V` — so a
+// typed or browsed path is reflected immediately (the nativePath parameter
+// is kept for call-site compatibility; the field is authoritative).
+static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& /*nativePath*/) {
+    wchar_t verBuf[200] = {0};
     bool wslMode = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
+    std::wstring path;
+    DlgGetText(hDlg, IDC_EDIT_BE_BIN, path);
+    path = TrimW(path);
     if (wslMode) {
         if (!g_wslDetectDone.load()) {
             SetDlgItemTextW(hDlg, IDC_STATIC_WSL_VERSION, L"WSL: detecting\u2026");
             return;
         }
         const WslInfo& wsl = DetectWslOnce();
-        if      (!wsl.wsl_present)   wcscpy_s(verBuf, L"WSL not detected");
-        else if (!wsl.be_available)  wcscpy_s(verBuf, L"bulk_extractor not found in WSL");
-        else if (!wsl.be_version.empty())
-            swprintf_s(verBuf, L"WSL bulk_extractor v%s", wsl.be_version.c_str());
-        else                         wcscpy_s(verBuf, L"WSL bulk_extractor detected");
+        if (!wsl.wsl_present) {
+            wcscpy_s(verBuf, L"WSL not detected");
+        } else if (path.empty()) {
+            wcscpy_s(verBuf, wsl.be_available ? L"no Linux binary selected"
+                                              : L"bulk_extractor not found in WSL");
+        } else {
+            std::wstring banner = ProbeWslBinaryBanner(path);
+            if (!banner.empty()) swprintf_s(verBuf, L"WSL: %s", banner.c_str());
+            else                 wcscpy_s(verBuf, L"WSL: binary did not answer -V (path wrong?)");
+        }
     } else {
-        std::wstring path = TrimW(nativePath);
         if (path.empty() || !FileExists(path)) {
             wcscpy_s(verBuf, L"no binary selected");
         } else {
@@ -2294,6 +2326,24 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
 
         case IDC_EDIT_INPUT_PATH:
             if (evt == EN_KILLFOCUS) UpdateScanTarget(hDlg);   // typed path settled
+            return TRUE;
+        case IDC_EDIT_BE_BIN:
+            // v0.5.0: a typed binary path settled -> refresh the readout (and,
+            // in native mode, the identity gate) without needing Browse.
+            if (evt == EN_KILLFOCUS && s && !g_workerActive.load() && !g_exportActive.load()) {
+                bool wslMode = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
+                if (!wslMode) {
+                    std::wstring p; DlgGetText(hDlg, IDC_EDIT_BE_BIN, p); p = TrimW(p);
+                    if (!p.empty() && FileExists(p)) {
+                        std::wstring idDetail;
+                        if (!VerifyHelperIdentity(p, kHelperIdentityNeedle, idDetail))
+                            ShowHelperRejection(hDlg, p, idDetail);
+                        else
+                            ClearHelperRejection(hDlg);
+                    }
+                }
+                UpdateBinaryStatusReadout(hDlg, s->beBinary);
+            }
             return TRUE;
         case IDC_BTN_BROWSE_INPUT_FILE: {
             std::wstring p;
