@@ -1598,8 +1598,11 @@ static void InstallDlgTooltips(HWND hDlg) {
           L"directory counts are a bounded walk (50,000 files / 1.5 s) \u2014 a trailing + means more." },
         { IDC_CHK_USE_WSL,
           L"Run a Linux bulk_extractor through WSL instead of the Windows binary. Windows paths are "
-          L"translated to /mnt/<drive>/... automatically. Greyed out when WSL or a bulk_extractor "
-          L"inside it isn't detected." },
+          L"translated to /mnt/<drive>/... automatically — but that bridge is slow, so data on "
+          L"Windows drives (images, exports, selected items) scans much faster with the Windows "
+          L"binary; WSL mainly pays off for data already inside the Linux filesystem or a "
+          L"custom-built bulk_extractor. Greyed out when WSL or a bulk_extractor inside it isn't "
+          L"detected." },
         { IDC_EDIT_BE_BIN,
           L"Path to bulk_extractor64.exe (or the Linux binary in WSL mode). Auto-filled from the cfg "
           L"sidecar or the copy next to the DLL." },
