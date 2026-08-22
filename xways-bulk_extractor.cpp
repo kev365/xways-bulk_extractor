@@ -57,6 +57,8 @@
 #include <cstdio>
 #include <cwctype>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -171,6 +173,48 @@ static const ScannerInfo kScanners[] = {
     {L"zip",            true , L"Scans for ZIP archives and components and recurses into them"},
 };
 static constexpr int kNumScanners = sizeof(kScanners) / sizeof(kScanners[0]);
+
+// --- v0.5.0: runtime scanner list ------------------------------------------
+//   The checklist is DISCOVERED from the selected bulk_extractor binary
+//   (`-h` for names + default state, `-H` for descriptions) — see
+//   ProbeScanners. kScanners[] above is now only the FALLBACK used when the
+//   probe fails, and the source of fallback tooltips by name. g_scanners is
+//   file-scope because the tooltip control keeps raw pointers into
+//   entries[i].tip — only RebuildScannerGrid may replace it (after tearing the
+//   tooltips down).
+struct ScannerEntry {
+    std::wstring name;
+    bool         defaultEnabled = false;
+    std::wstring tip;      // -H "Description:", else built-in tip by name, else "scanner <name>"
+};
+struct ScannerList {
+    std::vector<ScannerEntry> entries;   // sorted by name (the grid is column-major alphabetical)
+    bool         discovered = false;     // false => built-in fallback
+    bool         wsl        = false;
+    std::wstring binary;                 // path that was probed (native or Linux)
+    std::wstring failReason;             // when !discovered
+};
+static ScannerList g_scanners;
+static constexpr size_t kMaxScanners = (size_t)(IDC_SCANNER_LAST - IDC_SCANNER_BASE + 1);  // 100 control ids
+
+static const wchar_t* BuiltinTipFor(const std::wstring& name) {
+    for (int i = 0; i < kNumScanners; ++i)
+        if (name == kScanners[i].name) return kScanners[i].tip;
+    return nullptr;
+}
+static ScannerList BuiltinScannerList() {
+    ScannerList l;
+    l.discovered = false;
+    l.failReason = L"built-in";
+    for (int i = 0; i < kNumScanners; ++i) {
+        ScannerEntry e;
+        e.name = kScanners[i].name;
+        e.defaultEnabled = kScanners[i].defaultEnabled;
+        e.tip = kScanners[i].tip;
+        l.entries.push_back(e);
+    }
+    return l;
+}
 
 // --- XWF_CreateEvObj nType values (per live API page) ----------------------
 enum : DWORD {
@@ -297,6 +341,7 @@ struct WslInfo {
 };
 static const WslInfo& DetectWslOnce();
 static DWORD RunCaptureStdout(const std::wstring& cmd, std::wstring& out, DWORD timeoutMs, BOOL* pTimedOut);
+static std::wstring QuoteIfNeeded(const std::wstring& s);
 // v0.5.0: WSL detection runs on a background thread started in XT_Init (pure
 // Win32 process probes — no XWF_* calls) because a *stopped* WSL distro takes
 // 5-10 s to cold-start and used to either stall the dialog or time out and
@@ -479,7 +524,25 @@ struct CfgValues {
     // v0.3.0: WSL.
     bool         use_wsl_default = false;   // pre-checks the "Run via WSL" box on dialog open
     std::wstring wsl_be_binary;              // Linux path override (e.g. /usr/local/bin/bulk_extractor)
+    // v0.5.0: scanner toggles by NAME, diff-from-default only, and free-form
+    // extra arguments (see SaveCfg for the documented semantics).
+    std::vector<std::wstring> scanners_enable;
+    std::vector<std::wstring> scanners_disable;
+    std::wstring              extra_args;
 };
+
+// Split a cfg name list on commas / whitespace; trims; drops empties.
+static std::vector<std::wstring> SplitNameList(const std::wstring& v) {
+    std::vector<std::wstring> out;
+    std::wstring cur;
+    for (wchar_t c : v) {
+        if (c == L',' || c == L' ' || c == L'\t' || c == L';') {
+            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+        } else cur.push_back(c);
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
 
 static CfgValues LoadCfg(const std::wstring& selfDir) {
     CfgValues out;
@@ -522,6 +585,9 @@ static CfgValues LoadCfg(const std::wstring& selfDir) {
             out.use_wsl_default = (val == "true" || val == "yes" ||
                                    val == "1"    || val == "on");
         }
+        else if (key == "scanners_enable")  out.scanners_enable  = SplitNameList(Utf8ToWide(val));
+        else if (key == "scanners_disable") out.scanners_disable = SplitNameList(Utf8ToWide(val));
+        else if (key == "extra_args")       out.extra_args       = TrimW(Utf8ToWide(val));
     }
     return out;
 }
@@ -1008,7 +1074,14 @@ struct Settings {
     int          threads         = 0;        // 0 = let BE decide; otherwise emit -j N
     int          threadsMax      = 0;        // populated from GetSystemInfo; drives the dropdown range
     int          maxRecurse      = 12;       // BE default
-    std::vector<bool> scannerOn;             // parallel to kScanners; size == kNumScanners
+    std::vector<bool> scannerOn;             // parallel to g_scanners.entries when IDOK read the checkboxes
+    // v0.5.0: snapshot of (name, defaultEnabled) taken at IDOK alongside
+    // scannerOn, so the worker's command line never depends on g_scanners
+    // being rebuilt underneath it.
+    std::vector<std::pair<std::wstring, bool>> scannerRef;
+    std::vector<std::wstring> cfgScannersEnable;   // from cfg: names to force on  (applied after discovery)
+    std::vector<std::wstring> cfgScannersDisable;  // from cfg: names to force off
+    std::wstring extraArgs;                        // free-form pass-through, spliced before the input path
     bool         addToCase       = true;
     bool         openFolder      = false;
     bool         tagScanned      = true;   // every successfully exported item -> "BE scanned"
@@ -1363,8 +1436,8 @@ static void UpdateInputState(HWND hDlg, const Settings* s) {
 // Settings controls disabled while a run is in flight, re-enabled by the
 // WM_APP_DONE handler. Centralized so StartBeWorker and WM_APP_DONE stay in
 // sync (mirrors ual-timeliner's kRunLockIds). Scanner checkboxes (IDC_SCANNER_BASE
-// .. IDC_SCANNER_BASE+kNumScanners) are disabled separately via a loop (there
-// are up to kNumScanners of them, created programmatically).
+// .. IDC_SCANNER_BASE+N) are disabled separately via a loop (N =
+// g_scanners.entries.size(), created programmatically).
 static const int kRunLockIds[] = {
     IDC_RADIO_INPUT_EVOIMAGE, IDC_RADIO_INPUT_PICK, IDC_RADIO_INPUT_SELECTED,
     IDC_EDIT_INPUT_PATH, IDC_BTN_BROWSE_INPUT_FILE, IDC_BTN_BROWSE_INPUT_DIR,
@@ -1408,6 +1481,153 @@ static std::wstring ProbeWslBinaryBanner(const std::wstring& linuxPath) {
         }
     }
     return s_cacheBanner;
+}
+
+// --- v0.5.0: scanner discovery -----------------------------------------------
+//   `bulk_extractor -h` lists every scanner under two headers (format identical
+//   in 2.1.1 and 2.2.0):
+//       These scanners enabled; disable with -x:
+//          -x accts - disable scanner accts
+//            -S ssn_mode=0    ...                (option lines: skipped)
+//       These scanners disabled; enable with -e:
+//          -e base16 - enable scanner base16
+//       Options for setting carve mode ...       (stop)
+//   NOTE: -h exits NONZERO (1) while printing — never gate on the exit code.
+static bool ParseScannerHelp(const std::wstring& text, std::vector<ScannerEntry>& out) {
+    enum { NONE, ENABLED, DISABLED } mode = NONE;
+    std::wistringstream is(text);
+    std::wstring raw;
+    while (std::getline(is, raw)) {
+        std::wstring line = TrimW(raw);
+        if (line.rfind(L"These scanners enabled", 0) == 0)  { mode = ENABLED;  continue; }
+        if (line.rfind(L"These scanners disabled", 0) == 0) { mode = DISABLED; continue; }
+        if (line.rfind(L"Options for setting carve mode", 0) == 0) break;
+        if (mode == NONE) continue;
+        const bool ex = line.rfind(L"-x ", 0) == 0;
+        const bool en = line.rfind(L"-e ", 0) == 0;
+        if (!ex && !en) continue;                       // "-S key=val" option lines etc.
+        std::wstring rest = line.substr(3);
+        size_t sp = rest.find_first_of(L" \t");
+        std::wstring name = TrimW(sp == std::wstring::npos ? rest : rest.substr(0, sp));
+        if (name.empty()) continue;
+        ScannerEntry e;
+        e.name = name;
+        e.defaultEnabled = ex;                          // listed under "enabled; disable with -x"
+        out.push_back(e);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const ScannerEntry& a, const ScannerEntry& b) { return a.name < b.name; });
+    out.erase(std::unique(out.begin(), out.end(),
+                          [](const ScannerEntry& a, const ScannerEntry& b) { return a.name == b.name; }),
+              out.end());
+    return !out.empty();
+}
+
+//   `bulk_extractor -H` prints one block per scanner:
+//       Scanner Name: accts (ENABLED)      <- disabled ones have NO suffix
+//       flags:  ENABLED                    <- authoritative
+//       Description: scans for CCNs, ...
+//       ------------------------------------------------
+static void ParseScannerLongHelp(const std::wstring& text, std::vector<ScannerEntry>& inout) {
+    ScannerEntry* cur = nullptr;
+    std::wistringstream is(text);
+    std::wstring raw;
+    while (std::getline(is, raw)) {
+        std::wstring line = TrimW(raw);
+        if (line.rfind(L"Scanner Name:", 0) == 0) {
+            std::wstring name = TrimW(line.substr(13));
+            size_t cut = name.find_first_of(L" (");
+            if (cut != std::wstring::npos) name = name.substr(0, cut);
+            cur = nullptr;
+            for (auto& e : inout) if (e.name == name) { cur = &e; break; }
+        } else if (cur && line.rfind(L"flags:", 0) == 0) {
+            cur->defaultEnabled = line.find(L"ENABLED") != std::wstring::npos &&
+                                  line.find(L"DISABLED") == std::wstring::npos;
+        } else if (cur && line.rfind(L"Description:", 0) == 0) {
+            std::wstring d = TrimW(line.substr(12));
+            if (!d.empty()) cur->tip = d;
+        } else if (line.rfind(L"------", 0) == 0) {
+            cur = nullptr;
+        }
+    }
+}
+
+// Discover the scanner list of one binary. Pure process probing — no HWND,
+// no XWF_* beyond Log() — so it is safe on a background thread (WSL path).
+// Successful results are cached per (mode, path); fallbacks are NOT cached so
+// fixing the path and retrying re-probes.
+static ScannerList ProbeScanners(bool wsl, const std::wstring& path) {
+    static std::mutex s_mu;
+    static std::map<std::wstring, ScannerList> s_cache;
+    const std::wstring key = (wsl ? L"wsl:" : L"win:") + path;
+    {
+        std::lock_guard<std::mutex> lk(s_mu);
+        auto it = s_cache.find(key);
+        if (it != s_cache.end()) return it->second;
+    }
+
+    const std::wstring base = wsl ? (L"wsl.exe -e " + QuoteIfNeeded(path)) : QuoteIfNeeded(path);
+    const DWORD tmo = wsl ? 25000 : 10000;
+    const std::wstring where = (wsl ? L"WSL " : L"") + path;
+
+    std::wstring outH;
+    BOOL timedOut = FALSE;
+    DWORD rv = RunCaptureStdout(base + L" -h", outH, tmo, &timedOut);
+    std::vector<ScannerEntry> entries;
+    std::wstring fail;
+    if (timedOut)                                   fail = L"-h timed out";
+    else if (rv == (DWORD)-1 && outH.empty())       fail = L"could not launch the binary";
+    else if (!ParseScannerHelp(outH, entries))      fail = L"no scanner sections in -h output";
+    if (!fail.empty()) {
+        ScannerList fb = BuiltinScannerList();
+        fb.wsl = wsl; fb.binary = path; fb.failReason = fail;
+        Log(L"scanner list: built-in fallback (probe of " + where + L" failed: " + fail + L")");
+        return fb;
+    }
+
+    std::wstring outHH;
+    BOOL timedOut2 = FALSE;
+    RunCaptureStdout(base + L" -H", outHH, tmo, &timedOut2);
+    if (!timedOut2 && !outHH.empty()) ParseScannerLongHelp(outHH, entries);
+    else Log(L"scanner list: -H unavailable from " + where + L"; using built-in descriptions");
+    for (auto& e : entries) {
+        if (e.tip.empty()) {
+            const wchar_t* t = BuiltinTipFor(e.name);
+            e.tip = t ? std::wstring(t) : (L"scanner " + e.name);
+        }
+    }
+    if (entries.size() > kMaxScanners) {
+        Log(L"scanner list: " + std::to_wstring(entries.size()) + L" scanners reported; only the first " +
+            std::to_wstring(kMaxScanners) + L" can be shown (control-id budget)");
+        entries.resize(kMaxScanners);
+    }
+
+    ScannerList list;
+    list.entries = entries;
+    list.discovered = true;
+    list.wsl = wsl;
+    list.binary = path;
+    size_t onCount = 0;
+    for (const auto& e : entries) if (e.defaultEnabled) ++onCount;
+    Log(L"scanner list: " + std::to_wstring(entries.size()) + L" scanners discovered from " + where +
+        L" (" + std::to_wstring(onCount) + L" enabled by default)");
+    // Maintainer aid: how the binary differs from the built-in fallback table.
+    {
+        std::wstring added, missing;
+        for (const auto& e : entries) if (!BuiltinTipFor(e.name)) added += (added.empty() ? L"" : L", ") + e.name;
+        for (int i = 0; i < kNumScanners; ++i) {
+            bool found = false;
+            for (const auto& e : entries) if (e.name == kScanners[i].name) { found = true; break; }
+            if (!found) missing += (missing.empty() ? L"" : L", ") + std::wstring(kScanners[i].name);
+        }
+        if (!added.empty())   Log(L"scanner list: not in the built-in table: " + added);
+        if (!missing.empty()) Log(L"scanner list: built-in names this binary lacks: " + missing);
+    }
+    {
+        std::lock_guard<std::mutex> lk(s_mu);
+        s_cache[key] = list;
+    }
+    return list;
 }
 
 // v0.5.0: the readout always describes the binary named IN THE FIELD for the
@@ -1635,7 +1855,8 @@ static void InstallDlgTooltips(HWND hDlg) {
           L"settings to a file of your choosing." },
     };
     for (const auto& t : kTips) AddTip(tt, hDlg, t.id, t.tip);
-    for (int i = 0; i < kNumScanners; ++i) AddTip(tt, hDlg, IDC_SCANNER_BASE + i, kScanners[i].tip);
+    for (size_t i = 0; i < g_scanners.entries.size(); ++i)
+        AddTip(tt, hDlg, IDC_SCANNER_BASE + (int)i, g_scanners.entries[i].tip.c_str());
 }
 
 // --- About dialog (v0.5.0) --------------------------------------------------
@@ -1963,7 +2184,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
 
             const int padBot = 8, padLR = 12;
             const int nCols  = 4;   // v0.5.0: was 3
-            const int nRowsPerCol = (kNumScanners + nCols - 1) / nCols;
+            const int nScanners   = (int)g_scanners.entries.size();
+            const int nRowsPerCol = (nScanners + nCols - 1) / nCols;
 
             // v0.2.8: derive rowH from the checkbox font's actual measured
             // line height (TEXTMETRIC.tmHeight + small padding), not from
@@ -1991,7 +2213,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             int xs = tl.x + padLR;
             int ys = tl.y + padTop;
 
-            for (int i = 0; i < kNumScanners; ++i) {
+            for (int i = 0; i < (int)g_scanners.entries.size(); ++i) {
                 // v0.5.0: column-major — alphabetical order runs DOWN each
                 // column, then continues at the top of the next one.
                 int row = i % nRowsPerCol;
@@ -1999,14 +2221,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 int x = xs + col * colW;
                 int y = ys + row * rowH;
                 HWND cb = CreateWindowExW(
-                    0, L"BUTTON", kScanners[i].name,
+                    0, L"BUTTON", g_scanners.entries[i].name.c_str(),
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     x, y, colW - 4, rowH - 2,
                     hDlg, (HMENU)(INT_PTR)(IDC_SCANNER_BASE + i),
                     hInst, nullptr);
                 if (cb) SendMessageW(cb, WM_SETFONT, (WPARAM)cbFont, TRUE);
                 bool on = (i < (int)s->scannerOn.size())
-                    ? s->scannerOn[i] : kScanners[i].defaultEnabled;
+                    ? s->scannerOn[i] : g_scanners.entries[i].defaultEnabled;
                 CheckDlgButton(hDlg, IDC_SCANNER_BASE + i,
                                on ? BST_CHECKED : BST_UNCHECKED);
             }
@@ -2463,9 +2685,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             return TRUE;
         }
         case IDC_BTN_RESET_SCANNERS: {
-            for (int i = 0; i < kNumScanners; ++i) {
+            for (int i = 0; i < (int)g_scanners.entries.size(); ++i) {
                 CheckDlgButton(hDlg, IDC_SCANNER_BASE + i,
-                               kScanners[i].defaultEnabled ? BST_CHECKED : BST_UNCHECKED);
+                               g_scanners.entries[i].defaultEnabled ? BST_CHECKED : BST_UNCHECKED);
             }
             return TRUE;
         }
@@ -2473,14 +2695,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             // Smart toggle: if any scanner is currently unchecked, check
             // them all; otherwise (all are checked), uncheck them all.
             bool anyUnchecked = false;
-            for (int i = 0; i < kNumScanners; ++i) {
+            for (int i = 0; i < (int)g_scanners.entries.size(); ++i) {
                 if (IsDlgButtonChecked(hDlg, IDC_SCANNER_BASE + i) != BST_CHECKED) {
                     anyUnchecked = true;
                     break;
                 }
             }
             UINT newState = anyUnchecked ? BST_CHECKED : BST_UNCHECKED;
-            for (int i = 0; i < kNumScanners; ++i) {
+            for (int i = 0; i < (int)g_scanners.entries.size(); ++i) {
                 CheckDlgButton(hDlg, IDC_SCANNER_BASE + i, newState);
             }
             return TRUE;
@@ -2535,10 +2757,17 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 s->threads = (sel >= 0) ? (sel + 1) : 0;
             }
             s->maxRecurse     = DlgGetInt(hDlg, IDC_EDIT_MAXRECURSE, 12);
-            // Scanners — read each checkbox into the parallel scannerOn vector.
-            s->scannerOn.assign(kNumScanners, false);
-            for (int i = 0; i < kNumScanners; ++i) {
-                s->scannerOn[i] = IsDlgButtonChecked(hDlg, IDC_SCANNER_BASE + i) == BST_CHECKED;
+            // Scanners — read each checkbox into the parallel scannerOn vector and
+            // snapshot (name, default) so the run is independent of later rebuilds.
+            {
+                const size_t n = g_scanners.entries.size();
+                s->scannerOn.assign(n, false);
+                s->scannerRef.clear();
+                s->scannerRef.reserve(n);
+                for (size_t i = 0; i < n; ++i) {
+                    s->scannerOn[i] = IsDlgButtonChecked(hDlg, IDC_SCANNER_BASE + (int)i) == BST_CHECKED;
+                    s->scannerRef.emplace_back(g_scanners.entries[i].name, g_scanners.entries[i].defaultEnabled);
+                }
             }
             s->addToCase  = IsDlgButtonChecked(hDlg, IDC_CHK_ADD_TO_CASE) == BST_CHECKED;
             s->openFolder = IsDlgButtonChecked(hDlg, IDC_CHK_OPEN_FOLDER) == BST_CHECKED;
@@ -3034,12 +3263,13 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
     // Scanner flags: emit -e for any default-disabled scanner the user turned
     // on, -x for any default-enabled scanner they turned off. Skip any that
     // match BE's default — keeps the cmdline short and readable in the log.
-    for (int i = 0; i < kNumScanners; ++i) {
-        bool want = (i < (int)s.scannerOn.size())
-            ? s.scannerOn[i] : kScanners[i].defaultEnabled;
-        bool def  = kScanners[i].defaultEnabled;
-        if (want && !def) { cmd += L" -e "; cmd += kScanners[i].name; }
-        if (!want &&  def) { cmd += L" -x "; cmd += kScanners[i].name; }
+    // v0.5.0: keyed on the IDOK snapshot of the DISCOVERED list, so a flag is
+    // never emitted for a scanner the selected binary doesn't have.
+    for (size_t i = 0; i < s.scannerRef.size(); ++i) {
+        const bool def  = s.scannerRef[i].second;
+        const bool want = (i < s.scannerOn.size()) ? s.scannerOn[i] : def;
+        if (want && !def) { cmd += L" -e "; cmd += s.scannerRef[i].first; }
+        if (!want &&  def) { cmd += L" -x "; cmd += s.scannerRef[i].first; }
     }
 
     // BE wants `-R` only for directory-as-input scans (Windows-side check;
@@ -3770,7 +4000,7 @@ static void SetRunControlsEnabled(HWND hDlg, BOOL enable) {
         HWND h = GetDlgItem(hDlg, id);
         if (h) EnableWindow(h, enable);
     }
-    for (int i = 0; i < kNumScanners; ++i) {
+    for (int i = 0; i < (int)g_scanners.entries.size(); ++i) {
         HWND h = GetDlgItem(hDlg, IDC_SCANNER_BASE + i);
         if (h) EnableWindow(h, enable);
     }
@@ -3888,9 +4118,14 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
     if (s.threadsMax < 1) s.threadsMax = 1;
     s.threads = (s.threadsMax + 1) / 2;
 
-    // Scanner defaults match BE's defaults (parallel to kScanners).
-    s.scannerOn.assign(kNumScanners, false);
-    for (int i = 0; i < kNumScanners; ++i) s.scannerOn[i] = kScanners[i].defaultEnabled;
+    // v0.5.0: start from the built-in list; the dialog replaces it with the
+    // selected binary's own list (ProbeScanners) once it opens.
+    g_scanners = BuiltinScannerList();
+    s.scannerOn.assign(g_scanners.entries.size(), false);
+    for (size_t i = 0; i < g_scanners.entries.size(); ++i) s.scannerOn[i] = g_scanners.entries[i].defaultEnabled;
+    s.cfgScannersEnable  = cfg.scanners_enable;
+    s.cfgScannersDisable = cfg.scanners_disable;
+    s.extraArgs          = cfg.extra_args;
 
     // Context-driven UI defaults.
     s.selectionMode = ctx.selectionMode;
