@@ -336,6 +336,27 @@ static const int kShiftIds[] = {
 static const int kSnapIds[] = {
     IDC_LABEL_THREADS, IDC_COMBO_THREADS, IDC_LABEL_MAXRECURSE, IDC_EDIT_MAXRECURSE,
 };
+
+// --- v0.5.0: scanner discovery wiring ---------------------------------------
+//   Native probes run synchronously (~100-300 ms). WSL probes run on ONE
+//   background thread (a cold distro can take 10+ s): each request bumps
+//   g_scanProbeGen; the thread stores its result + the gen it served; the
+//   100 ms timer joins a finished thread and applies the result only if its
+//   gen is still current. A request arriving while the thread runs parks in
+//   the pending slot and starts after the join. The thread never touches an
+//   HWND and never calls XWF_* (Log() aside); XT_Done joins it.
+static std::thread            g_scanProbeThread;
+static std::atomic<unsigned>  g_scanProbeGen{0};
+static std::atomic<unsigned>  g_scanProbeReadyGen{0};
+static std::atomic<bool>      g_scanProbeRunning{false};
+static std::mutex             g_scanProbeMutex;
+static ScannerList            g_scanProbeResult;       // under g_scanProbeMutex
+static bool                   g_scanProbePending = false;
+static bool                   g_scanProbePendingWsl = false;
+static std::wstring           g_scanProbePendingPath;
+static bool                   g_cfgOverridesApplied = false;   // per dialog instance
+struct Settings;
+static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std::wstring& rawPath);
 static std::thread         g_workerThread;   // joinable; see comment above
 static HWND                g_dlgHwnd = nullptr;
 static ULONGLONG           g_runStartTick = 0;
@@ -1718,6 +1739,12 @@ static void ApplyWslDetectionToDialog(HWND hDlg, Settings* s) {
         SetDlgItemTextW(hDlg, IDC_EDIT_BE_BIN, s->beBinary.c_str());
     }
     UpdateBinaryStatusReadout(hDlg, s->beBinary);
+    // v0.5.0: a WSL-mode dialog couldn't discover scanners until now.
+    if (IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED) {
+        std::wstring bePath;
+        DlgGetText(hDlg, IDC_EDIT_BE_BIN, bePath);
+        RequestScannerDiscovery(hDlg, s, true, bePath);
+    }
 }
 
 // v0.5.0: paint the bottom status/progress bar (IDC_STATIC_BE_STATUS,
@@ -2203,6 +2230,121 @@ static void RebuildScannerGrid(HWND hDlg, const std::vector<bool>& on) {
     InvalidateRect(hDlg, nullptr, TRUE);
 }
 
+// cfg scanners_enable / scanners_disable: force names on/off. `targets`
+// limits which names may be touched (names new to the grid) so a rebuild
+// never overwrites the analyst's in-session edits. Unknown names are logged
+// once per dialog (first application).
+static void ApplyCfgScannerOverrides(const ScannerList& list, std::vector<bool>& on,
+                                     const std::vector<std::wstring>& enable,
+                                     const std::vector<std::wstring>& disable,
+                                     const std::vector<std::wstring>& targets,
+                                     bool logUnknown) {
+    auto apply = [&](const std::vector<std::wstring>& names, bool value, const wchar_t* key) {
+        for (const auto& n : names) {
+            size_t idx = list.entries.size();
+            for (size_t i = 0; i < list.entries.size(); ++i) if (list.entries[i].name == n) { idx = i; break; }
+            if (idx == list.entries.size()) {
+                if (logUnknown) Log(L"cfg: " + std::wstring(key) + L": unknown scanner '" + n + L"' ignored");
+                continue;
+            }
+            bool targeted = false;
+            for (const auto& t : targets) if (t == n) { targeted = true; break; }
+            if (targeted && idx < on.size()) on[idx] = value;
+        }
+    };
+    apply(enable,  true,  L"scanners_enable");
+    apply(disable, false, L"scanners_disable");
+}
+
+static void ApplyScannerList(HWND hDlg, Settings* s, const ScannerList& list) {
+    std::vector<bool> oldOn = ReadScannerChecks(hDlg);
+    std::vector<bool> newOn = CarryScannerState(g_scanners, oldOn, list);
+    std::vector<std::wstring> targets;
+    for (const auto& e : list.entries) {
+        bool existed = false;
+        if (g_cfgOverridesApplied)
+            for (const auto& o : g_scanners.entries) if (o.name == e.name) { existed = true; break; }
+        if (!existed) targets.push_back(e.name);
+    }
+    if (s) ApplyCfgScannerOverrides(list, newOn, s->cfgScannersEnable, s->cfgScannersDisable,
+                                    targets, /*logUnknown=*/!g_cfgOverridesApplied);
+    g_cfgOverridesApplied = true;
+    g_scanners = list;
+    RebuildScannerGrid(hDlg, newOn);
+}
+
+static void StartScanProbeThread(unsigned gen, bool wsl, const std::wstring& path) {
+    if (g_scanProbeThread.joinable()) g_scanProbeThread.join();   // only called when not running
+    g_scanProbeRunning.store(true);
+    g_scanProbeThread = std::thread([gen, wsl, path]() {
+        ScannerList r = ProbeScanners(wsl, path);
+        {
+            std::lock_guard<std::mutex> lk(g_scanProbeMutex);
+            g_scanProbeResult = r;
+        }
+        g_scanProbeReadyGen.store(gen);
+        g_scanProbeRunning.store(false);
+    });
+}
+
+// Called whenever the effective (wsl, path) pair may have changed.
+static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std::wstring& rawPath) {
+    if (g_workerActive.load() || g_exportActive.load()) return;
+    const std::wstring path = TrimW(rawPath);
+    if (g_scanners.discovered && g_scanners.wsl == wsl && g_scanners.binary == path) return;  // same binary
+
+    if (path.empty() || (!wsl && !FileExists(path))) {
+        if (!g_scanners.discovered && g_scanners.wsl == wsl && g_scanners.binary == path) return;
+        ScannerList fb = BuiltinScannerList();
+        fb.wsl = wsl; fb.binary = path;
+        fb.failReason = path.empty() ? L"no binary selected" : L"binary not found";
+        Log(L"scanner list: built-in fallback (" + fb.failReason + L")");
+        ApplyScannerList(hDlg, s, fb);
+        return;
+    }
+    if (!wsl) {
+        SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS, L"Scanners (discovering\u2026)");
+        UpdateWindow(GetDlgItem(hDlg, IDC_GROUP_SCANNERS));
+        ApplyScannerList(hDlg, s, ProbeScanners(false, path));
+        return;
+    }
+    // WSL: wait for WSL detection (ApplyWslDetectionToDialog re-requests), then
+    // probe on the background thread.
+    if (!g_wslDetectDone.load()) return;
+    SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS, L"Scanners (discovering\u2026)");
+    const unsigned gen = g_scanProbeGen.fetch_add(1) + 1;
+    if (g_scanProbeRunning.load()) {
+        g_scanProbePending = true;
+        g_scanProbePendingWsl = true;
+        g_scanProbePendingPath = path;
+        return;
+    }
+    StartScanProbeThread(gen, true, path);
+}
+
+// Timer hook: reap a finished probe thread, apply a still-current result,
+// and start any parked request.
+static void PollScanProbe(HWND hDlg, Settings* s) {
+    if (g_scanProbeRunning.load() || !g_scanProbeThread.joinable()) return;
+    const unsigned ready = g_scanProbeReadyGen.load();
+    g_scanProbeThread.join();
+    ScannerList r;
+    {
+        std::lock_guard<std::mutex> lk(g_scanProbeMutex);
+        r = g_scanProbeResult;
+    }
+    g_scanProbeReadyGen.store(0);
+    if (ready != 0 && ready == g_scanProbeGen.load() &&
+        !g_workerActive.load() && !g_exportActive.load()) {
+        ApplyScannerList(hDlg, s, r);
+    }
+    if (g_scanProbePending) {
+        g_scanProbePending = false;
+        const unsigned gen = g_scanProbeGen.fetch_add(1) + 1;
+        StartScanProbeThread(gen, g_scanProbePendingWsl, g_scanProbePendingPath);
+    }
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     static Settings* s = nullptr;
     switch (msg) {
@@ -2352,7 +2494,16 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         // installs the tooltips.
         g_gridTpl.captured = false;      // fresh template per dialog instance
         g_dlgTooltip = nullptr;
+        g_cfgOverridesApplied = false;
         RebuildScannerGrid(hDlg, s->scannerOn);
+        // v0.5.0: now discover the selected binary's own scanner list (native:
+        // synchronous; WSL: background, applied by the 100 ms timer).
+        {
+            std::wstring bePath;
+            DlgGetText(hDlg, IDC_EDIT_BE_BIN, bePath);
+            const bool wslMode = IsDlgButtonChecked(hDlg, IDC_CHK_USE_WSL) == BST_CHECKED;
+            RequestScannerDiscovery(hDlg, s, wslMode, bePath);
+        }
 
         g_scanTargetPending = true;           // v0.5.0: count after the dialog shows
         UpdateInputState(hDlg, s);
@@ -2422,6 +2573,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         if (wp == kCtrlPollTimerId) {
             // v0.5.0: background WSL detection landed -> enable/refresh.
             if (!g_wslUiApplied && g_wslDetectDone.load()) ApplyWslDetectionToDialog(hDlg, s);
+            PollScanProbe(hDlg, s);   // v0.5.0: background scanner discovery
             // v0.5.0: owner-drawn Run/Cancel don't get the theme's automatic
             // hot-tracking, so poll the cursor and repaint on hover changes.
             {
@@ -2605,6 +2757,11 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                     }
                 }
                 UpdateBinaryStatusReadout(hDlg, s->beBinary);
+                {
+                    std::wstring bePath;
+                    DlgGetText(hDlg, IDC_EDIT_BE_BIN, bePath);
+                    if (wslMode || !g_helperRejected) RequestScannerDiscovery(hDlg, s, wslMode, bePath);   // v0.5.0
+                }
             }
             return TRUE;
         case IDC_BTN_BROWSE_INPUT_FILE: {
@@ -2648,6 +2805,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 // and clear any stale native-mode rejection.
                 SetDlgItemTextW(hDlg, IDC_EDIT_BE_BIN, p.c_str());
                 ClearHelperRejection(hDlg);
+                UpdateBinaryStatusReadout(hDlg, p);
+                RequestScannerDiscovery(hDlg, s, true, p);   // v0.5.0
                 return TRUE;
             }
             // v0.4.0: native mode — identity-verify the picked exe before
@@ -2665,6 +2824,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 Log(L"bulk_extractor binary accepted (" + p + L") — " + idDetail);
             }
             UpdateBinaryStatusReadout(hDlg, p);
+            if (!g_helperRejected) RequestScannerDiscovery(hDlg, s, false, p);   // v0.5.0
             return TRUE;
         }
         case IDC_CHK_USE_WSL: {
@@ -2697,8 +2857,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                         ShowHelperRejection(hDlg, nativePath, idDetail);
                 }
             }
-            // v0.5.0: readout swaps with the mode (WSL status vs native version).
+            // v0.5.0: readout swaps with the mode (WSL status vs native version),
+            // and the scanner list follows the binary now in effect.
             UpdateBinaryStatusReadout(hDlg, s->beBinary);
+            {
+                std::wstring bePath;
+                DlgGetText(hDlg, IDC_EDIT_BE_BIN, bePath);
+                RequestScannerDiscovery(hDlg, s, nowWsl, bePath);
+            }
             return TRUE;
         }
         case IDC_BTN_ABOUT:
@@ -2997,6 +3163,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
     case WM_DESTROY:
         g_dlgTooltip = nullptr;          // child of the dialog — gone with it
         g_gridTpl.captured = false;      // v0.5.0: fresh template next time
+        g_scanProbeGen.fetch_add(1);     // v0.5.0: any in-flight probe result is stale now
+        g_scanProbePending = false;
         // v0.4.0: tear down the Ctrl-poll + flash timers and reset the gesture
         // state so a re-opened dialog starts clean. The bold font is process-
         // cached (reused across opens), so it's left alive intentionally.
@@ -4385,6 +4553,7 @@ LONG __stdcall XT_Done(void*) {
         g_workerThread.join();
     }
     if (g_wslDetectThread.joinable()) g_wslDetectThread.join();   // v0.5.0
+    if (g_scanProbeThread.joinable()) g_scanProbeThread.join();   // v0.5.0
     Log(L"XT_Done");
     return 0;
 }
