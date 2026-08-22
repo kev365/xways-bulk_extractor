@@ -1277,17 +1277,35 @@ static int DlgGetInt(HWND h, int id, int defaultVal) {
 }
 
 // Browse helpers (file and folder).
+// `path` seeds the picker. A Linux-style path ("/usr/bin/x", WSL mode) is not
+// a valid Windows file name and would make GetOpenFileName fail silently
+// (FNERR_INVALIDFILENAME — the dialog simply never appears), so such seeds
+// are replaced by the WSL network root (\\wsl.localhost\) as the initial
+// directory, where Explorer lists the installed distros.
 static bool BrowseForFile(HWND parent, std::wstring& path) {
     wchar_t buf[MAX_PATH * 2] = {0};
-    if (!path.empty()) wcsncpy_s(buf, path.c_str(), MAX_PATH * 2 - 1);
+    const wchar_t* initialDir = nullptr;
+    if (!path.empty()) {
+        if (path[0] == L'/') initialDir = L"\\\\wsl.localhost\\";
+        else                 wcsncpy_s(buf, path.c_str(), MAX_PATH * 2 - 1);
+    }
     OPENFILENAMEW ofn = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = parent;
-    ofn.lpstrFile   = buf;
-    ofn.nMaxFile    = MAX_PATH * 2;
-    ofn.lpstrFilter = L"All files\0*.*\0Image files (*.dd;*.E01;*.raw;*.img)\0*.dd;*.E01;*.raw;*.img\0";
-    ofn.Flags       = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetOpenFileNameW(&ofn)) return false;
+    ofn.lStructSize     = sizeof(ofn);
+    ofn.hwndOwner       = parent;
+    ofn.lpstrFile       = buf;
+    ofn.nMaxFile        = MAX_PATH * 2;
+    ofn.lpstrInitialDir = initialDir;
+    ofn.lpstrFilter     = L"All files\0*.*\0Image files (*.dd;*.E01;*.raw;*.img)\0*.dd;*.E01;*.raw;*.img\0";
+    ofn.Flags           = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) {
+        const DWORD err = CommDlgExtendedError();
+        if (err != 0) {
+            wchar_t m[160];
+            swprintf_s(m, L"file picker failed to open (CommDlgExtendedError 0x%04lX)", err);
+            Log(m);
+        }
+        return false;
+    }
     path = buf;
     return true;
 }
