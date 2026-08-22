@@ -391,6 +391,23 @@ static std::wstring StripExtendedPathPrefix(std::wstring s) {
     return s;
 }
 
+// v0.5.0: 8.3 short form of an existing path, or the path unchanged when the
+// volume has 8.3 names disabled / the call fails. Used ONLY for the paths
+// handed to bulk_extractor on its command line (native mode): BE names every
+// carved file after the forensic path, and on Windows its directory-strip
+// only looks for '/' — so in -R (directory) mode the carved-file name embeds
+// the ENTIRE input path. Output dir + carved subdir + that name sails past
+// MAX_PATH and BE aborts with exit 6 "Disk write error ... probably full"
+// (reproduced 2026-08-21 on a 5,446-file export; alerts.txt shows the
+// "cannot open file for writing" path). Short paths keep both halves short.
+static std::wstring ShortPathForCmdline(const std::wstring& path) {
+    if (path.empty()) return path;
+    wchar_t buf[MAX_PATH * 2] = {0};
+    DWORD n = GetShortPathNameW(path.c_str(), buf, (DWORD)(MAX_PATH * 2));
+    if (n == 0 || n >= MAX_PATH * 2) return path;
+    return buf;
+}
+
 // v0.5.0: the status line is an owner-drawn static (the bottom progress bar),
 // so setting its text must also invalidate it — SetDlgItemText alone doesn't
 // repaint an SS_OWNERDRAW control reliably. All status writes go through here.
@@ -2822,8 +2839,12 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
         cmd = QuoteIfNeeded(s.beBinary);
     }
 
+    // v0.5.0: native mode passes 8.3 short paths (see ShortPathForCmdline) so
+    // BE's path-embedding carved-file names stay under MAX_PATH. Everything
+    // on our side (evidence object, labels, Open output) keeps the long path.
+    const std::wstring outArg = wsl ? pathArg(s.outputDir) : ShortPathForCmdline(s.outputDir);
     cmd += L" -o ";
-    cmd += QuoteIfNeeded(pathArg(s.outputDir));
+    cmd += QuoteIfNeeded(outArg);
 
     if (s.threads > 0) {
         wchar_t buf[32];
@@ -2853,10 +2874,18 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
     bool isDir = DirExists(inputPath);
     if (isDir) cmd += L" -R";
 
+    const std::wstring inArg = wsl ? pathArg(inputPath) : ShortPathForCmdline(inputPath);
     cmd += L" ";
-    cmd += QuoteIfNeeded(pathArg(inputPath));
+    cmd += QuoteIfNeeded(inArg);
 
     Log(L"command: " + cmd);
+    if (!wsl && (outArg != s.outputDir || inArg != inputPath)) {
+        Log(L"(paths passed to bulk_extractor in 8.3 short form: its carved-file names embed "
+            L"the full input path on Windows and would exceed MAX_PATH otherwise)");
+    } else if (!wsl && isDir) {
+        Log(L"(note: 8.3 short names unavailable on this volume \u2014 long carved-file names "
+            L"from a directory scan may exceed MAX_PATH; see README \"Known issues\")");
+    }
 
     std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
     cmdline.push_back(L'\0');
@@ -3165,8 +3194,9 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
 
         const wchar_t* nm = XWF_GetItemName ? XWF_GetItemName(itemID) : L"";
         std::wstring leaf = SanitizeForFilename(nm ? nm : L"");
-        // Cap leaf length to keep paths short.
-        if (leaf.size() > 64) leaf = leaf.substr(0, 64);
+        // Cap leaf length to keep paths short — BE embeds this whole file
+        // name in every carved-file name it derives from it (v0.5.0: 40, was 64).
+        if (leaf.size() > 40) leaf = leaf.substr(0, 40);
 
         wchar_t prefix[32];
         swprintf_s(prefix, L"xwitem_%ld_", itemID);
@@ -3357,6 +3387,11 @@ static RunOutcome ExecuteBeRun(const Settings& s, const RunPrep& prep,
     {
         wchar_t buf[320];
         swprintf_s(buf, L"bulk_extractor exit code: %lu", (unsigned long)exitCodeOut);
+        if (exitCodeOut == 6) {            // BE: DiskWriteError during phase 1/2
+            wcscat_s(buf, L" (6 = bulk_extractor \"disk write error\": on Windows this is usually "
+                          L"a carved-file path over MAX_PATH rather than a full disk \u2014 see "
+                          L"alerts.txt in the output dir for the exact path)");
+        }
         if (exitCodeOut == 0xC000013A) {   // STATUS_CONTROL_C_EXIT
             wcscat_s(buf, L" (0xC000013A: bulk_extractor's console window was closed "
                           L"or Ctrl+C was pressed — use the dialog's Cancel button instead)");
