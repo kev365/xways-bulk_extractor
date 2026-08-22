@@ -327,6 +327,7 @@ static HWND g_dlgTooltip = nullptr;                  // TOOLTIPS_CLASS window; r
 // are to the RIGHT (parallel) so they don't move; the Threads / Max recursion
 // pair is snapped separately (kSnapIds) to sit directly above Output handling.
 static const int kShiftIds[] = {
+    IDC_LABEL_EXTRA_ARGS, IDC_EDIT_EXTRA_ARGS,
     IDC_GROUP_OUTPUT,
     IDC_LABEL_OUTPUT, IDC_EDIT_OUTPUT_DIR, IDC_BTN_BROWSE_OUTPUT,
     IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
@@ -1302,7 +1303,11 @@ static CfgValues CollectCfgFromDialog(HWND hDlg, const Settings* s) {
         if (checked && !def)  cfg.scanners_enable.push_back(g_scanners.entries[i].name);
         if (!checked && def)  cfg.scanners_disable.push_back(g_scanners.entries[i].name);
     }
-    cfg.extra_args = s ? TrimW(s->extraArgs) : std::wstring();
+    {
+        std::wstring ea;
+        DlgGetText(hDlg, IDC_EDIT_EXTRA_ARGS, ea);
+        cfg.extra_args = TrimW(ea);
+    }
     // default_output_dir is intentionally NOT persisted (output-dir convention).
     return cfg;
 }
@@ -1521,7 +1526,7 @@ static const int kRunLockIds[] = {
     IDC_EDIT_INPUT_PATH, IDC_BTN_BROWSE_INPUT_FILE, IDC_BTN_BROWSE_INPUT_DIR,
     IDC_EDIT_OUTPUT_DIR, IDC_BTN_BROWSE_OUTPUT,
     IDC_EDIT_BE_BIN, IDC_BTN_BROWSE_BE, IDC_CHK_USE_WSL,
-    IDC_COMBO_THREADS, IDC_EDIT_MAXRECURSE,
+    IDC_COMBO_THREADS, IDC_EDIT_MAXRECURSE, IDC_EDIT_EXTRA_ARGS,
     IDC_BTN_RESET_SCANNERS, IDC_BTN_TOGGLE_ALL,
     IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
     IDC_CHK_TAG_SCANNED, IDC_CHK_TAG_HITS,
@@ -1930,6 +1935,11 @@ static void InstallDlgTooltips(HWND hDlg) {
           L"Worker threads for bulk_extractor (-j). The default leaves half the cores free for X-Ways." },
         { IDC_EDIT_MAXRECURSE,
           L"Maximum recursion depth into nested / compressed data (-M). bulk_extractor's default is 12." },
+        { IDC_EDIT_EXTRA_ARGS,
+          L"Extra bulk_extractor options, appended verbatim after the scanner flags and before the "
+          L"input path. Examples: -S jpeg_carve_mode=2 (carve every JPEG), --dedupe-mode 0, "
+          L"-f <regex> / -F <file> (extra find patterns). Don't repeat -o / -e / -x / -R / -j / -M "
+          L"\u2014 the dialog already sets those. Saved to bulk_extractor.cfg with Ctrl+Run." },
         { IDC_STATIC_BE_STATUS, L"Run status and progress." },
         { IDC_BTN_ABOUT,       L"About this X-Tension." },
         { IDC_BTN_OPEN_OUTPUT,
@@ -2440,6 +2450,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             if (s_labelFont) {
                 static const int kLabelIds[] = {
                     IDC_LABEL_SCAN_TARGET,   // v0.5.0
+                    IDC_LABEL_EXTRA_ARGS,    // v0.5.0
                     IDC_LABEL_OUTPUT, IDC_LABEL_BE_BIN,
                     IDC_LABEL_THREADS, IDC_LABEL_MAXRECURSE,
                     // v0.3.0: WSL-version status text rendered bold to match
@@ -2470,6 +2481,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
 
         SetDlgItemTextW(hDlg, IDC_EDIT_INPUT_PATH,    s->inputPath.c_str());
         SetDlgItemTextW(hDlg, IDC_EDIT_OUTPUT_DIR,    s->outputDir.c_str());
+        // v0.5.0: extra arguments + a cue-banner hint (shown while empty).
+        SetDlgItemTextW(hDlg, IDC_EDIT_EXTRA_ARGS,    s->extraArgs.c_str());
+        SendDlgItemMessageW(hDlg, IDC_EDIT_EXTRA_ARGS, EM_SETCUEBANNER, TRUE,
+            (LPARAM)L"e.g.  -S jpeg_carve_mode=2   --dedupe-mode 0   -f <regex>");
         // BE binary edit: shows the Linux path when WSL mode is on, the
         // Windows path otherwise. Toggling the checkbox swaps which one is
         // displayed (handled in the IDC_CHK_USE_WSL command handler below).
@@ -2578,6 +2593,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         {
             static const int kEdits[] = {
                 IDC_EDIT_BE_BIN, IDC_EDIT_INPUT_PATH, IDC_EDIT_OUTPUT_DIR, IDC_EDIT_MAXRECURSE,
+                IDC_EDIT_EXTRA_ARGS,
             };
             FitSingleLineEdits(hDlg, kEdits, sizeof(kEdits) / sizeof(kEdits[0]));
         }
@@ -2990,6 +3006,33 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 s->threads = (sel >= 0) ? (sel + 1) : 0;
             }
             s->maxRecurse     = DlgGetInt(hDlg, IDC_EDIT_MAXRECURSE, 12);
+            // v0.5.0: extra arguments — warn when they collide with options the
+            // dialog already emits (BE's last occurrence wins, silently).
+            {
+                DlgGetText(hDlg, IDC_EDIT_EXTRA_ARGS, s->extraArgs);
+                s->extraArgs = TrimW(s->extraArgs);
+                static const wchar_t* kOwned[] = { L"-o", L"-e", L"-x", L"-R", L"-j", L"-M", L"-E" };
+                std::wstring clash;
+                std::wistringstream ts(s->extraArgs);
+                std::wstring tok;
+                while (ts >> tok) {
+                    for (const wchar_t* o : kOwned) {
+                        if (tok == o || (tok.size() > 2 && tok.compare(0, 2, o) == 0 && o[1] != L'R' && o[1] != L'E')) {
+                            clash = tok; break;
+                        }
+                    }
+                    if (!clash.empty()) break;
+                }
+                if (!clash.empty()) {
+                    std::wstring msg = L"Extra arguments contain \"" + clash +
+                        L"\", which the dialog already sets (the later one on the command line wins).\n\nRun anyway?";
+                    if (MessageBoxW(hDlg, msg.c_str(), L"bulk_extractor", MB_YESNO | MB_ICONWARNING) != IDYES) {
+                        SetFocus(GetDlgItem(hDlg, IDC_EDIT_EXTRA_ARGS));
+                        return TRUE;
+                    }
+                    Log(L"warning: extra arguments override a dialog option: " + clash);
+                }
+            }
             // Scanners — read each checkbox into the parallel scannerOn vector and
             // snapshot (name, default) so the run is independent of later rebuilds.
             {
@@ -3512,6 +3555,14 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
     // BE wants `-R` only for directory-as-input scans (Windows-side check;
     // same answer either way).
     if (isDir) cmd += L" -R";
+
+    // v0.5.0: free-form extra arguments, verbatim (the analyst owns quoting;
+    // no WSL path translation is attempted inside them).
+    if (!s.extraArgs.empty()) {
+        cmd += L" ";
+        cmd += s.extraArgs;
+        Log(L"extra arguments: " + s.extraArgs);
+    }
 
     const std::wstring inArg = wsl ? pathArg(inputPath)
                              : shortPaths ? ShortPathForCmdline(inputPath) : inputPath;

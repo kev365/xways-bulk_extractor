@@ -29,7 +29,7 @@
 //
 // v0.2.7+: dialog font 10pt for non-scanner controls; scanner checkboxes
 // programmatically created with their own 9pt font for density.
-IDD_SETTINGS DIALOGEX 0, 0, 400, 498
+IDD_SETTINGS DIALOGEX 0, 0, 400, 514
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "bulk_extractor - Settings"
 FONT 10, "MS Shell Dlg"
@@ -88,24 +88,29 @@ BEGIN
     EDITTEXT                                                            IDC_EDIT_MAXRECURSE,      355, 255,  38,  12, ES_AUTOHSCROLL | ES_NUMBER
 
     // -------- Output handling (full width) --------
-    GROUPBOX        "Output handling",                                  IDC_GROUP_OUTPUT,           7, 387, 386,  72
-    LTEXT           "Output directory:",                                IDC_LABEL_OUTPUT,          14, 401,  80,   8
-    EDITTEXT                                                            IDC_EDIT_OUTPUT_DIR,       14, 411, 318,  12, ES_AUTOHSCROLL
-    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_OUTPUT,    336, 410,  47,  14
+    // v0.5.0: free-form extra bulk_extractor arguments, between the Scanners
+    // group and Output handling. Moves with the scanner auto-fit (kShiftIds).
+    LTEXT           "Extra arguments:",                                 IDC_LABEL_EXTRA_ARGS,      14, 386,  60,   8
+    EDITTEXT                                                            IDC_EDIT_EXTRA_ARGS,       78, 384, 315,  12, ES_AUTOHSCROLL
+
+    GROUPBOX        "Output handling",                                  IDC_GROUP_OUTPUT,           7, 403, 386,  72
+    LTEXT           "Output directory:",                                IDC_LABEL_OUTPUT,          14, 417,  80,   8
+    EDITTEXT                                                            IDC_EDIT_OUTPUT_DIR,       14, 427, 318,  12, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...",                                        IDC_BTN_BROWSE_OUTPUT,    336, 426,  47,  14
     AUTOCHECKBOX    "Add output directory to X-Ways case as evidence object (Directory)",
-                                                                        IDC_CHK_ADD_TO_CASE,       14, 431, 366,  10
-    AUTOCHECKBOX    "Open output folder in Explorer when done",         IDC_CHK_OPEN_FOLDER,       14, 445, 366,  10
+                                                                        IDC_CHK_ADD_TO_CASE,       14, 447, 366,  10
+    AUTOCHECKBOX    "Open output folder in Explorer when done",         IDC_CHK_OPEN_FOLDER,       14, 461, 366,  10
 
     // -------- Bottom: status/progress bar, then About / Open output | Run / Cancel
     // The status bar is owner-drawn (DrawStatusBar): idle track, marquee
     // while running, soft fill when done, red flash on helper rejection.
     // Run/Cancel are owner-draw for the Ctrl-to-save gesture (DM_SETDEFID
     // keeps Enter on Run).
-    CONTROL         "",                                                 IDC_STATIC_BE_STATUS,     "Static", SS_OWNERDRAW | SS_NOTIFY | WS_CHILD | WS_VISIBLE, 7, 464, 386, 12
-    PUSHBUTTON      "About",                                            IDC_BTN_ABOUT,              7, 480,  45,  14
-    PUSHBUTTON      "Open output",                                      IDC_BTN_OPEN_OUTPUT,       56, 480,  60,  14
-    PUSHBUTTON      "Run",                                              IDOK,                     283, 480,  50,  14, BS_OWNERDRAW
-    PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 480,  50,  14, BS_OWNERDRAW
+    CONTROL         "",                                                 IDC_STATIC_BE_STATUS,     "Static", SS_OWNERDRAW | SS_NOTIFY | WS_CHILD | WS_VISIBLE, 7, 480, 386, 12
+    PUSHBUTTON      "About",                                            IDC_BTN_ABOUT,              7, 496,  45,  14
+    PUSHBUTTON      "Open output",                                      IDC_BTN_OPEN_OUTPUT,       56, 496,  60,  14
+    PUSHBUTTON      "Run",                                              IDOK,                     283, 496,  50,  14, BS_OWNERDRAW
+    PUSHBUTTON      "Cancel",                                           IDCANCEL,                 339, 496,  50,  14, BS_OWNERDRAW
 END
 
 // =============================================================================

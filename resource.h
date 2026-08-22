@@ -35,6 +35,9 @@
 #define IDC_COMBO_THREADS           131
 #define IDC_LABEL_MAXRECURSE        132
 #define IDC_EDIT_MAXRECURSE         133
+// v0.5.0: free-form extra bulk_extractor arguments (spliced before the input path)
+#define IDC_LABEL_EXTRA_ARGS        134
+#define IDC_EDIT_EXTRA_ARGS         135
 
 // Scanners
 #define IDC_GROUP_SCANNERS          140
