@@ -318,7 +318,7 @@ struct ScannerGridTemplate {
     bool  captured = false;
     RECT  group{};                                   // client rect of IDC_GROUP_SCANNERS
     int   dlgW = 0, dlgH = 0;                        // dialog window size
-    std::vector<std::pair<int, POINT>> below;        // id -> template top-left (client)
+    std::vector<std::pair<int, RECT>>  below;        // id -> template client rect
 };
 static ScannerGridTemplate g_gridTpl;
 static HWND g_dlgTooltip = nullptr;                  // TOOLTIPS_CLASS window; recreated on rebuild
@@ -1553,6 +1553,7 @@ static std::wstring ProbeWslBinaryBanner(const std::wstring& linuxPath) {
     static std::wstring s_cachePath, s_cacheBanner;
     if (linuxPath == s_cachePath) return s_cacheBanner;
     s_cachePath = linuxPath; s_cacheBanner.clear();
+    Log(L"probing WSL binary version: " + linuxPath + L" -V\u2026");
     std::wstring out;
     DWORD rv = RunCaptureStdout(L"wsl.exe -e \"" + linuxPath + L"\" -V", out, 15000, nullptr);
     if (rv == 0) {
@@ -2110,9 +2111,32 @@ static std::vector<bool> CarryScannerState(const ScannerList& oldL, const std::v
 // instance), resizes the group AND the dialog in either direction, re-snaps
 // Threads / Max recursion above the Output group, and re-installs tooltips.
 // `on` is parallel to g_scanners.entries (size mismatch -> defaults).
+static void AlignLabelToControl(HWND hDlg, int labelId, int ctlId) {
+    HWND hl = GetDlgItem(hDlg, labelId), hc = GetDlgItem(hDlg, ctlId);
+    if (!hl || !hc) return;
+    RECT rl, rc;
+    GetWindowRect(hl, &rl); MapWindowPoints(HWND_DESKTOP, hDlg, (POINT*)&rl, 2);
+    GetWindowRect(hc, &rc); MapWindowPoints(HWND_DESKTOP, hDlg, (POINT*)&rc, 2);
+    const int ctlMid = (rc.top + rc.bottom) / 2;
+    const int lh     = rl.bottom - rl.top;
+    SetWindowPos(hl, nullptr, rl.left, ctlMid - lh / 2, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static void RebuildScannerGrid(HWND hDlg, const std::vector<bool>& on) {
     HWND grp = GetDlgItem(hDlg, IDC_GROUP_SCANNERS);
     if (!grp) return;
+    // Freeze painting: destroying + re-creating 30-odd checkboxes and moving
+    // every control below them otherwise repaints step by step (looks like a
+    // crash in slow motion on a WSL toggle).
+    SendMessageW(hDlg, WM_SETREDRAW, FALSE, 0);
+    struct RedrawGuard {
+        HWND h;
+        ~RedrawGuard() {
+            SendMessageW(h, WM_SETREDRAW, TRUE, 0);
+            RedrawWindow(h, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+    } redrawGuard{ hDlg };
     auto clientRc = [&](HWND h, RECT& out) {
         GetWindowRect(h, &out);
         MapWindowPoints(HWND_DESKTOP, hDlg, (POINT*)&out, 2);
@@ -2129,7 +2153,7 @@ static void RebuildScannerGrid(HWND hDlg, const std::vector<bool>& on) {
             HWND h = GetDlgItem(hDlg, id);
             if (!h) return;
             RECT r; clientRc(h, r);
-            g_gridTpl.below.emplace_back(id, POINT{ r.left, r.top });
+            g_gridTpl.below.emplace_back(id, r);
         };
         for (int id : kShiftIds) cap(id);
         for (int id : kSnapIds)  cap(id);
@@ -2147,8 +2171,15 @@ static void RebuildScannerGrid(HWND hDlg, const std::vector<bool>& on) {
                  SWP_NOZORDER | SWP_NOACTIVATE);
     for (const auto& kv : g_gridTpl.below) {
         HWND h = GetDlgItem(hDlg, kv.first);
-        if (h) SetWindowPos(h, nullptr, kv.second.x, kv.second.y, 0, 0,
-                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if (!h) continue;
+        // Restore by CENTRE: FitSingleLineEdits may have shrunk an edit about
+        // its centre after the template was captured, so restoring the
+        // template top would leave it top-aligned with its label.
+        RECT cur; clientRc(h, cur);
+        const int tplH = kv.second.bottom - kv.second.top;
+        const int curH = cur.bottom - cur.top;
+        SetWindowPos(h, nullptr, kv.second.left, kv.second.top + (tplH - curH) / 2, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     SetWindowPos(hDlg, nullptr, 0, 0, g_gridTpl.dlgW, g_gridTpl.dlgH,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2246,12 +2277,18 @@ static void RebuildScannerGrid(HWND hDlg, const std::vector<bool>& on) {
             SetWindowPos(GetDlgItem(hDlg, id), nullptr, r.left, r.top + dy, 0, 0,
                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         };
-        RECT rOut, rTog, rTC, rME;
+        RECT rOut, rTog, rTC, rME, rEA;
         if (idRc(IDC_GROUP_OUTPUT, rOut) && idRc(IDC_BTN_TOGGLE_ALL, rTog) &&
             idRc(IDC_COMBO_THREADS, rTC) && idRc(IDC_EDIT_MAXRECURSE, rME)) {
+            // The Extra-arguments row sits between the group and Output
+            // handling; snap above whichever comes first.
+            int anchorTop = rOut.top;
+            if (idRc(IDC_EDIT_EXTRA_ARGS, rEA) && rEA.top < anchorTop) anchorTop = rEA.top;
+            RECT rEL;
+            if (idRc(IDC_LABEL_EXTRA_ARGS, rEL) && rEL.top < anchorTop) anchorTop = rEL.top;
             const int pitch  = rME.top - rTC.top;
             const int gapPx  = MulDiv(6, rME.bottom - rME.top, 12);
-            int meTop = rOut.top - gapPx - (rME.bottom - rME.top);
+            int meTop = anchorTop - gapPx - (rME.bottom - rME.top);
             const int minTop = rTog.bottom + gapPx + pitch;
             if (meTop < minTop) meTop = minTop;
             const int dM = meTop - rME.top;
@@ -2262,6 +2299,10 @@ static void RebuildScannerGrid(HWND hDlg, const std::vector<bool>& on) {
             moveBy(IDC_LABEL_THREADS,    dT);
         }
     }
+    // Inline labels centred on their controls (template rows only approximate).
+    AlignLabelToControl(hDlg, IDC_LABEL_THREADS,    IDC_COMBO_THREADS);
+    AlignLabelToControl(hDlg, IDC_LABEL_MAXRECURSE, IDC_EDIT_MAXRECURSE);
+    AlignLabelToControl(hDlg, IDC_LABEL_EXTRA_ARGS, IDC_EDIT_EXTRA_ARGS);
 
     // 7) Title reflects provenance; tooltips re-installed for the new controls.
     SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS,
@@ -2345,6 +2386,7 @@ static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std:
     if (!wsl) {
         SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS, L"Scanners (discovering\u2026)");
         UpdateWindow(GetDlgItem(hDlg, IDC_GROUP_SCANNERS));
+        Log(L"scanner list: probing " + path + L" (-h / -H)\u2026");
         ApplyScannerList(hDlg, s, ProbeScanners(false, path));
         return;
     }
@@ -2352,6 +2394,7 @@ static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std:
     // probe on the background thread.
     if (!g_wslDetectDone.load()) return;
     SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS, L"Scanners (discovering\u2026)");
+    Log(L"scanner list: probing WSL " + path + L" (-h / -H) in the background\u2026");
     const unsigned gen = g_scanProbeGen.fetch_add(1) + 1;
     if (g_scanProbeRunning.load()) {
         g_scanProbePending = true;
@@ -2596,6 +2639,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 IDC_EDIT_EXTRA_ARGS,
             };
             FitSingleLineEdits(hDlg, kEdits, sizeof(kEdits) / sizeof(kEdits[0]));
+            AlignLabelToControl(hDlg, IDC_LABEL_MAXRECURSE, IDC_EDIT_MAXRECURSE);
+            AlignLabelToControl(hDlg, IDC_LABEL_EXTRA_ARGS, IDC_EDIT_EXTRA_ARGS);
+            AlignLabelToControl(hDlg, IDC_LABEL_THREADS,    IDC_COMBO_THREADS);
         }
 
         // (v0.5.0: tooltips are installed by RebuildScannerGrid above.)
