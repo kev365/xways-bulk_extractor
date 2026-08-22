@@ -659,9 +659,10 @@ static std::string WideToUtf8(const std::wstring& w) {
 //   <caseRoot>\xways-bulk_extractor\bulk_extractor_<stamp>, so pinning a single
 //   dir in cfg would defeat the timestamped-subdir scheme (and BE mishandles a
 //   reused output dir: pre-2.2.0 refuses loudly; 2.2.0's restart logic exits 0
-//   having silently processed nothing). The dialog's scanner toggles /
-//   threads / tagging are NOT cfg-backed in LoadCfg, so they're intentionally
-//   left out to keep this a faithful round-trip of the existing cfg surface.
+//   having silently processed nothing). v0.5.0: scanner toggles ARE persisted
+//   — by NAME and only where they differ from the selected binary's own
+//   defaults (scanners_enable / scanners_disable) — plus extra_args. Threads /
+//   tagging remain session-only.
 //
 //   Atomic-ish: any existing cfg is rotated to <path>.bak before the overwrite
 //   so a botched write is recoverable.
@@ -708,6 +709,26 @@ static bool SaveCfg(const std::wstring& path, const CfgValues& cfg) {
     o += L"# Keep the exported xwitem_*.bin temp dir after a successful run (default\r\n";
     o += L"# false = auto-clean). true/yes/1/on are truthy.\r\n";
     o += L"keep_temp_dir=";  o += bs(cfg.keep_temp_dir);  o += L"\r\n\r\n";
+
+    auto joinNames = [](const std::vector<std::wstring>& v) {
+        std::wstring r;
+        for (const auto& n : v) { if (!r.empty()) r += L","; r += n; }
+        return r;
+    };
+    o += L"# ----- Scanners ---------------------------------------------------------------\r\n";
+    o += L"# The checklist is discovered from the selected bulk_extractor binary\r\n";
+    o += L"# (`bulk_extractor -h`) each time the dialog opens. Only scanners you changed\r\n";
+    o += L"# from that binary's OWN defaults are listed here, by name, comma-separated.\r\n";
+    o += L"# Names the binary doesn't know are ignored (a line appears in Messages).\r\n";
+    o += L"scanners_enable=";  o += joinNames(cfg.scanners_enable);  o += L"\r\n";
+    o += L"scanners_disable="; o += joinNames(cfg.scanners_disable); o += L"\r\n\r\n";
+
+    o += L"# ----- Extra arguments --------------------------------------------------------\r\n";
+    o += L"# Appended verbatim to the bulk_extractor command line after the scanner\r\n";
+    o += L"# flags and -R, before the input path. Examples (BE 2.2.0):\r\n";
+    o += L"#   -S jpeg_carve_mode=2   --dedupe-mode 0   -f <regex>   -F <pattern-file>\r\n";
+    o += L"# Don't put -o / -e / -x / -R / -j / -M here; the dialog already sets those.\r\n";
+    o += L"extra_args=";  o += cfg.extra_args;  o += L"\r\n\r\n";
 
     o += L"# ----- Output directory (NOT persisted) ------------------------------------\r\n";
     o += L"# Per project convention the run output auto-resolves per-run to\r\n";
@@ -1273,6 +1294,15 @@ static CfgValues CollectCfgFromDialog(HWND hDlg, const Settings* s) {
     }
     cfg.use_wsl_default = nowWsl;
     cfg.keep_temp_dir   = s ? s->keepTempDir : false;
+    // v0.5.0: scanner toggles by name, diff-from-default only, against the
+    // list currently shown (= the selected binary's own defaults).
+    for (size_t i = 0; i < g_scanners.entries.size(); ++i) {
+        const bool checked = IsDlgButtonChecked(hDlg, IDC_SCANNER_BASE + (int)i) == BST_CHECKED;
+        const bool def     = g_scanners.entries[i].defaultEnabled;
+        if (checked && !def)  cfg.scanners_enable.push_back(g_scanners.entries[i].name);
+        if (!checked && def)  cfg.scanners_disable.push_back(g_scanners.entries[i].name);
+    }
+    cfg.extra_args = s ? TrimW(s->extraArgs) : std::wstring();
     // default_output_dir is intentionally NOT persisted (output-dir convention).
     return cfg;
 }

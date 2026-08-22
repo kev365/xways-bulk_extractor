@@ -30,8 +30,9 @@
 
 
 # ----- WSL bulk_extractor (Linux) -------------------------------------------
-# Run bulk_extractor via WSL instead of the native Windows binary (useful
-# because BE 2.1.x installs cleanly on Linux but doesn't build on Windows).
+# Run bulk_extractor via WSL instead of the native Windows binary. Optional
+# since BE 2.2.0 ships an official Windows binary (with E01 support); the
+# /mnt/<drive> bridge is slow, so Windows-resident data scans faster natively.
 #
 # wsl_be_binary : Linux-side path, e.g. /usr/bin/bulk_extractor. Empty =
 #                 auto-detected via `wsl -e which bulk_extractor`.
@@ -56,6 +57,28 @@
 # Truthy values: true / yes / 1 / on. (On a FAILED run the dir is always kept
 # so you can inspect what was sent to BE.)
 # keep_temp_dir=false
+
+# ----- Scanners (v0.5.0) ------------------------------------------------------
+# The Scanners checklist is DISCOVERED from the selected bulk_extractor binary
+# (`bulk_extractor -h`, descriptions from -H) every time the dialog opens, so
+# new upstream scanners appear without an X-Tension update. The built-in table
+# is only a fallback when the probe fails ("Scanners (built-in list)").
+#
+# Ctrl+Run saves, by NAME, only the scanners you changed from that binary's own
+# defaults. Comma/space-separated. Names the selected binary doesn't know are
+# ignored (a line appears in the Messages window).
+# scanners_enable=base16,wordlist
+# scanners_disable=vcard_carved,elf
+
+# ----- Extra arguments (v0.5.0) -----------------------------------------------
+# Appended verbatim to the bulk_extractor command line after the scanner flags
+# and -R, before the input path. Examples (BE 2.2.0):
+#   -S jpeg_carve_mode=2      carve every JPEG, not just encoded ones
+#   --dedupe-mode 0           disable feature de-duplication
+#   -f <regex>  /  -F <file>  extra "find" patterns
+# Don't repeat -o / -e / -x / -R / -j / -M here; the dialog already sets those
+# (Run warns if it sees them).
+# extra_args=
 
 
 # ----- Output directory (NOT persisted by Ctrl+Run) -------------------------
