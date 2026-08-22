@@ -578,6 +578,8 @@ struct CfgValues {
     std::vector<std::wstring> scanners_enable;
     std::vector<std::wstring> scanners_disable;
     std::wstring              extra_args;
+    int scanners_enable_line  = 0;   // 1-based cfg line of the key (0 = absent) for diagnostics
+    int scanners_disable_line = 0;
 };
 
 // Split a cfg name list on commas / whitespace; trims; drops empties.
@@ -602,7 +604,9 @@ static CfgValues LoadCfg(const std::wstring& selfDir) {
     if (!f) return out;
 
     std::string line;
+    int lineNo = 0;
     while (std::getline(f, line)) {
+        ++lineNo;
         // Strip leading whitespace and comments.
         size_t i = 0;
         while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
@@ -634,8 +638,8 @@ static CfgValues LoadCfg(const std::wstring& selfDir) {
             out.use_wsl_default = (val == "true" || val == "yes" ||
                                    val == "1"    || val == "on");
         }
-        else if (key == "scanners_enable")  out.scanners_enable  = SplitNameList(Utf8ToWide(val));
-        else if (key == "scanners_disable") out.scanners_disable = SplitNameList(Utf8ToWide(val));
+        else if (key == "scanners_enable")  { out.scanners_enable  = SplitNameList(Utf8ToWide(val)); out.scanners_enable_line  = lineNo; }
+        else if (key == "scanners_disable") { out.scanners_disable = SplitNameList(Utf8ToWide(val)); out.scanners_disable_line = lineNo; }
         else if (key == "extra_args")       out.extra_args       = TrimW(Utf8ToWide(val));
     }
     return out;
@@ -861,6 +865,49 @@ static std::wstring DetectHelperVersionFromFlag(const std::wstring& exePath) {
     return line;
 }
 
+// v0.5.0: zero-execution pre-check. True only for a PE image whose subsystem
+// is the Windows console (CUI). bulk_extractor is a console tool; a GUI exe
+// (notepad.exe ...) or a non-PE file must be rejected WITHOUT ever being
+// launched — the `--version` banner gate and the `-h` scanner probe both
+// spawn the file, and a GUI program would pop its own window (and hang the
+// probe until the timeout). outWhy gets a short reason on failure.
+static bool IsConsolePeImage(const std::wstring& exePath, std::wstring& outWhy) {
+    HANDLE h = CreateFileW(exePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { outWhy = L"cannot open file"; return false; }
+    BYTE hdr[4096] = {};
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, hdr, sizeof(hdr), &got, nullptr);
+    CloseHandle(h);
+    if (!ok || got < sizeof(IMAGE_DOS_HEADER)) { outWhy = L"not a Windows executable (too small)"; return false; }
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(hdr);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) { outWhy = L"not a Windows executable (no MZ header)"; return false; }
+    const DWORD off = (DWORD)dos->e_lfanew;
+    if (off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + sizeof(WORD) * 35 > got) {
+        outWhy = L"not a Windows executable (PE header out of range)"; return false;
+    }
+    if (*reinterpret_cast<const DWORD*>(hdr + off) != IMAGE_NT_SIGNATURE) {
+        outWhy = L"not a Windows executable (no PE signature)"; return false;
+    }
+    const IMAGE_FILE_HEADER* fh = reinterpret_cast<const IMAGE_FILE_HEADER*>(hdr + off + sizeof(DWORD));
+    // Subsystem sits at the same offset (68) in both the 32- and 64-bit
+    // optional headers.
+    const BYTE* opt = hdr + off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+    const WORD magic = *reinterpret_cast<const WORD*>(opt);
+    if (magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC && magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        outWhy = L"not a Windows executable (unknown optional header)"; return false;
+    }
+    if (fh->Characteristics & IMAGE_FILE_DLL) { outWhy = L"a DLL, not a program"; return false; }
+    const WORD subsystem = *reinterpret_cast<const WORD*>(opt + 68);
+    if (subsystem != IMAGE_SUBSYSTEM_WINDOWS_CUI) {
+        outWhy = (subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI)
+                   ? L"a Windows GUI program, not a console tool"
+                   : L"not a console program (PE subsystem " + std::to_wstring(subsystem) + L")";
+        return false;
+    }
+    return true;
+}
+
 // True if the exe's PE VERSIONINFO carries needleLower (already lowercased) in
 // any of the standard string fields.
 static bool PeIdentityContains(const std::wstring& exePath, const wchar_t* needleLower) {
@@ -900,8 +947,45 @@ static bool PeIdentityContains(const std::wstring& exePath, const wchar_t* needl
 static bool VerifyHelperIdentity(const std::wstring& exePath,
                                  const wchar_t* needle,
                                  std::wstring& outDetail) {
+    // v0.5.0: verdicts are cached per path for the life of the DLL — the
+    // dialog re-checks on open / Browse / mode toggle / Run, and a rejected
+    // GUI exe used to be launched once per check. (A file that changes on
+    // disk under the same path is re-examined by the cheap PE check below
+    // only if its size or write time changed.)
+    struct Verdict { bool ok; std::wstring detail; INT64 size; INT64 mtime; };
+    static std::map<std::wstring, Verdict> s_cache;
+    static std::mutex s_cacheMx;
+    INT64 fsize = -1, fmtime = -1;
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad = {};
+        if (GetFileAttributesExW(exePath.c_str(), GetFileExInfoStandard, &fad)) {
+            fsize  = ((INT64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            fmtime = ((INT64)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(s_cacheMx);
+        auto it = s_cache.find(exePath);
+        if (it != s_cache.end() && it->second.size == fsize && it->second.mtime == fmtime) {
+            outDetail = it->second.detail;
+            return it->second.ok;
+        }
+    }
+    auto remember = [&](bool ok) {
+        std::lock_guard<std::mutex> lk(s_cacheMx);
+        s_cache[exePath] = Verdict{ ok, outDetail, fsize, fmtime };
+        return ok;
+    };
+
     std::wstring needleLower = needle;
     for (auto& c : needleLower) c = (wchar_t)towlower(c);
+
+    // Never execute something that cannot be a console tool.
+    std::wstring why;
+    if (!IsConsolePeImage(exePath, why)) {
+        outDetail = why + L" (not executed)";
+        return remember(false);
+    }
 
     bool pe = PeIdentityContains(exePath, needleLower.c_str());
     bool flag = false;
@@ -917,7 +1001,7 @@ static bool VerifyHelperIdentity(const std::wstring& exePath,
     else if (flag)   outDetail = L"--version banner match";
     else             outDetail = L"no \"" + std::wstring(needle) +
                                   L"\" marker in PE VERSIONINFO or --version output";
-    return pe || flag;
+    return remember(pe || flag);
 }
 
 // --- Item path / export helpers (selected-items mode) ----------------------
@@ -1159,6 +1243,8 @@ struct Settings {
     std::vector<std::pair<std::wstring, bool>> scannerRef;
     std::vector<std::wstring> cfgScannersEnable;   // from cfg: names to force on  (applied after discovery)
     std::vector<std::wstring> cfgScannersDisable;  // from cfg: names to force off
+    int cfgScannersEnableLine  = 0;                // cfg line numbers (0 = key absent) for diagnostics
+    int cfgScannersDisableLine = 0;
     std::wstring extraArgs;                        // free-form pass-through, spliced before the input path
     bool         addToCase       = true;
     bool         openFolder      = false;
@@ -1754,11 +1840,17 @@ static void UpdateBinaryStatusReadout(HWND hDlg, const std::wstring& /*nativePat
         } else {
             static std::wstring s_cachePath, s_cacheBanner;
             if (path != s_cachePath) {
-                s_cachePath   = path;
-                s_cacheBanner = DetectHelperVersionFromFlag(path);
+                s_cachePath = path;
+                std::wstring why;
+                // v0.5.0: the identity gate decides whether this file may be
+                // executed at all; a non-console / non-PE file never is.
+                s_cacheBanner = IsConsolePeImage(path, why) ? DetectHelperVersionFromFlag(path)
+                                                            : std::wstring();
             }
             if (!s_cacheBanner.empty())
                 swprintf_s(verBuf, L"%s detected", s_cacheBanner.c_str());
+            else if (g_helperRejected)
+                wcscpy_s(verBuf, L"rejected \u2014 not bulk_extractor");
             else
                 wcscpy_s(verBuf, L"version unknown");
         }
@@ -2327,13 +2419,17 @@ static void ApplyCfgScannerOverrides(const ScannerList& list, std::vector<bool>&
                                      const std::vector<std::wstring>& enable,
                                      const std::vector<std::wstring>& disable,
                                      const std::vector<std::wstring>& targets,
-                                     bool logUnknown) {
-    auto apply = [&](const std::vector<std::wstring>& names, bool value, const wchar_t* key) {
+                                     bool logUnknown, int enableLine, int disableLine) {
+    auto apply = [&](const std::vector<std::wstring>& names, bool value, const wchar_t* key, int lineNo) {
         for (const auto& n : names) {
             size_t idx = list.entries.size();
             for (size_t i = 0; i < list.entries.size(); ++i) if (list.entries[i].name == n) { idx = i; break; }
             if (idx == list.entries.size()) {
-                if (logUnknown) Log(L"cfg: " + std::wstring(key) + L": unknown scanner '" + n + L"' ignored");
+                if (logUnknown) {
+                    std::wstring where = lineNo > 0 ? L" (bulk_extractor.cfg line " + std::to_wstring(lineNo) + L")" : L"";
+                    Log(L"cfg: " + std::wstring(key) + where + L": unknown scanner '" + n +
+                        L"' ignored \u2014 not in the selected binary's scanner list");
+                }
                 continue;
             }
             bool targeted = false;
@@ -2341,8 +2437,8 @@ static void ApplyCfgScannerOverrides(const ScannerList& list, std::vector<bool>&
             if (targeted && idx < on.size()) on[idx] = value;
         }
     };
-    apply(enable,  true,  L"scanners_enable");
-    apply(disable, false, L"scanners_disable");
+    apply(enable,  true,  L"scanners_enable",  enableLine);
+    apply(disable, false, L"scanners_disable", disableLine);
 }
 
 static std::wstring PathLeaf(const std::wstring& p) {
@@ -2374,7 +2470,7 @@ static void ApplyScannerList(HWND hDlg, Settings* s, const ScannerList& list) {
         if (!existed) targets.push_back(e.name);
     }
     if (s) ApplyCfgScannerOverrides(list, newOn, s->cfgScannersEnable, s->cfgScannersDisable,
-                                    targets, /*logUnknown=*/!g_cfgOverridesApplied);
+                                    targets, /*logUnknown=*/!g_cfgOverridesApplied, s->cfgScannersEnableLine, s->cfgScannersDisableLine);
     g_cfgOverridesApplied = true;
     g_scanners = list;
     RebuildScannerGrid(hDlg, newOn);
@@ -2410,6 +2506,18 @@ static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std:
         return;
     }
     if (!wsl) {
+        // v0.5.0: never launch a binary the identity gate rejects (or that is
+        // not even a console program) just to ask it for its scanner list.
+        std::wstring gateDetail;
+        if (g_helperRejected || !VerifyHelperIdentity(path, kHelperIdentityNeedle, gateDetail)) {
+            if (!g_scanners.discovered && g_scanners.wsl == wsl && g_scanners.binary == path) return;
+            ScannerList fb = BuiltinScannerList();
+            fb.wsl = wsl; fb.binary = path;
+            fb.failReason = L"binary rejected, not probed";
+            Log(L"scanner list: built-in fallback (" + fb.failReason + L": " + gateDetail + L")");
+            ApplyScannerList(hDlg, s, fb);
+            return;
+        }
         SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS, L"Scanners (discovering\u2026)");
         UpdateWindow(GetDlgItem(hDlg, IDC_GROUP_SCANNERS));
         Log(L"scanner list: probing " + path + L" (-h / -H)\u2026");
@@ -2581,6 +2689,19 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         // disabled and the 100 ms timer applies it when it lands.
         g_wslUiApplied = false;
         EnableWindow(GetDlgItem(hDlg, IDC_CHK_USE_WSL), FALSE);
+        // v0.5.0: identity-gate the initial NATIVE binary FIRST — the readout
+        // and the scanner discovery below execute the binary, and a rejected
+        // one must never be launched. (WSL mode is exempt: the Linux binary
+        // can't be inspected from Windows.)
+        g_helperRejected   = false;
+        g_helperFlashTicks = 0;
+        g_dlgHwnd = hDlg;
+        if (!s->useWsl && !TrimW(s->beBinary).empty() && FileExists(s->beBinary)) {
+            std::wstring idDetail;
+            if (!VerifyHelperIdentity(s->beBinary, kHelperIdentityNeedle, idDetail)) {
+                ShowHelperRejection(hDlg, s->beBinary, idDetail);
+            }
+        }
         if (g_wslDetectDone.load()) {
             ApplyWslDetectionToDialog(hDlg, s);
         } else {
@@ -2629,28 +2750,12 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         UpdateInputState(hDlg, s);
         PostMessageW(hDlg, WM_APP_COUNT, 0, 0);
 
-        // v0.4.0: helper-exe identity verification of the initial NATIVE
-        // binary. WSL mode is exempt (the Linux binary can't be inspected from
-        // Windows). If a non-empty native path is present but fails the gate,
-        // surface the in-dialog flash rejection straight away so the analyst
-        // can Browse... to a real bulk_extractor64.exe before Run.
-        g_helperRejected   = false;
-        g_helperFlashTicks = 0;
-
-        // v0.5.0: capture the dialog HWND (the worker's PostMessage target) and
-        // reset the run-state globals to idle so a re-opened dialog starts clean.
-        g_dlgHwnd = hDlg;
+        // v0.5.0: reset the run-state globals to idle so a re-opened dialog
+        // starts clean. (The identity gate ran at the top of WM_INITDIALOG.)
         g_workerActive.store(false);
         g_cancelRequested.store(false);
         g_runStartTick = 0;
-
-        SetBeStatus(hDlg, L"");
-        if (!s->useWsl && !TrimW(s->beBinary).empty() && FileExists(s->beBinary)) {
-            std::wstring idDetail;
-            if (!VerifyHelperIdentity(s->beBinary, kHelperIdentityNeedle, idDetail)) {
-                ShowHelperRejection(hDlg, s->beBinary, idDetail);
-            }
-        }
+        if (!g_helperRejected) SetBeStatus(hDlg, L"");
 
         // v0.4.0: Ctrl-to-save / Save-as gesture. Run + Cancel are BS_OWNERDRAW
         // (we paint them in WM_DRAWITEM); DM_SETDEFID flags Run as the default
@@ -2982,7 +3087,21 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                 }
             }
             // v0.5.0: readout swaps with the mode (WSL status vs native version),
-            // and the scanner list follows the binary now in effect.
+            // and the scanner list follows the binary now in effect. The WSL
+            // version probe (-V) is synchronous and can take several seconds on
+            // a cold WSL, so paint the toggled checkbox + a "probing" readout
+            // BEFORE it runs — otherwise the click looks ignored.
+            {
+                SetDlgItemTextW(hDlg, IDC_STATIC_WSL_VERSION,
+                                nowWsl ? L"WSL: probing the Linux binary\u2026" : L"probing\u2026");
+                SetBeStatus(hDlg, nowWsl ? L"Switching to WSL \u2014 probing the Linux bulk_extractor\u2026"
+                                         : L"Switching to the Windows binary\u2026");
+                UpdateWindow(GetDlgItem(hDlg, IDC_CHK_USE_WSL));
+                UpdateWindow(GetDlgItem(hDlg, IDC_EDIT_BE_BIN));
+                UpdateWindow(GetDlgItem(hDlg, IDC_STATIC_WSL_VERSION));
+                HWND hBar = GetDlgItem(hDlg, IDC_STATIC_BE_STATUS);
+                if (hBar) { InvalidateRect(hBar, nullptr, TRUE); UpdateWindow(hBar); }
+            }
             UpdateBinaryStatusReadout(hDlg, s->beBinary);
             {
                 std::wstring bePath;
@@ -3102,8 +3221,21 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                     if (!clash.empty()) break;
                 }
                 if (!clash.empty()) {
-                    std::wstring msg = L"Extra arguments contain \"" + clash +
-                        L"\", which the dialog already sets (the later one on the command line wins).\n\nRun anyway?";
+                    // Say which dialog setting the flag duplicates, in plain words.
+                    const wchar_t* what = L"an option the dialog already sets";
+                    switch (clash[1]) {
+                    case L'o': what = L"the output directory (set in \"Output handling\" below)"; break;
+                    case L'e': case L'x': what = L"which scanners are enabled (set by the Scanners checklist)"; break;
+                    case L'R': what = L"recursive directory scanning (added automatically for directory inputs)"; break;
+                    case L'j': what = L"the thread count (set by \"Threads\")"; break;
+                    case L'M': what = L"the recursion depth (set by \"Max recursion\")"; break;
+                    case L'E': what = L"the scanner selection (-E disables every scanner except one)"; break;
+                    }
+                    std::wstring msg = L"Extra arguments contain \"" + clash + L"\".\n\n"
+                        L"That flag controls " + std::wstring(what) + L". bulk_extractor uses whichever "
+                        L"occurrence comes last on its command line, and the extra arguments are placed "
+                        L"after the dialog's own options \u2014 so your \"" + clash + L"\" will override the "
+                        L"dialog setting.\n\nRun anyway?";
                     if (MessageBoxW(hDlg, msg.c_str(), L"bulk_extractor", MB_YESNO | MB_ICONWARNING) != IDYES) {
                         SetFocus(GetDlgItem(hDlg, IDC_EDIT_EXTRA_ARGS));
                         return TRUE;
@@ -4489,8 +4621,10 @@ static void RunFlow(HWND parent, RunCtx& ctx) {
     g_scanners = BuiltinScannerList();
     s.scannerOn.assign(g_scanners.entries.size(), false);
     for (size_t i = 0; i < g_scanners.entries.size(); ++i) s.scannerOn[i] = g_scanners.entries[i].defaultEnabled;
-    s.cfgScannersEnable  = cfg.scanners_enable;
-    s.cfgScannersDisable = cfg.scanners_disable;
+    s.cfgScannersEnable      = cfg.scanners_enable;
+    s.cfgScannersDisable     = cfg.scanners_disable;
+    s.cfgScannersEnableLine  = cfg.scanners_enable_line;
+    s.cfgScannersDisableLine = cfg.scanners_disable_line;
     s.extraArgs          = cfg.extra_args;
 
     // Context-driven UI defaults.
@@ -4677,7 +4811,7 @@ LONG __stdcall XT_ProcessItem(LONG nItemID, void*) {
         g_run.selected.push_back(nItemID);
         // v0.5.0: a sign of life on big selections — X-Ways hands items over
         // one callback at a time before the dialog can open.
-        if ((g_run.selected.size() % 2000) == 0) {
+        if ((g_run.selected.size() % 10000) == 0) {
             Log(L"collecting selected items from X-Ways\u2026 " +
                 WithCommas(g_run.selected.size()));
         }
