@@ -285,6 +285,29 @@ X-Ways v21.1 Beta 2 added `XWF_Mount` / `XWF_Unmount` (drive-letter mount of the
 
 Net: the export pattern's WriteFile cost is real but the selection-fidelity + ID-mapping wins outweigh it for BE specifically — Mount is the right tool for wrappers around single-path scanners (hindsight, plaso, ual-timeliner, capa, yara), not for selection-scoped ones like this.
 
+## Known issues
+
+### bulk_extractor exit 6 "Disk write error ... Disk is probably full" on directory scans (Windows)
+
+**Upstream bug, mitigated here since v0.5.0.** bulk_extractor names every
+carved file after the forensic path, and `feature_recorder.cpp` strips the
+directory part with `rfind('/')` — forward slash only. On Windows the recursed
+path uses backslashes, so in `-R` (directory) mode the carved-file name embeds
+the *entire* input path. `<output dir>\<carver>_carved\000\<that name>` runs
+past `MAX_PATH`, the open fails, and BE aborts with exit 6 and the misleading
+"disk full" message the moment any carver fires. Reproduced 2026-08-21 on a
+5,446-file selected-items export with BE 2.2.0 (`alerts.txt` in the output dir
+records the exact `cannot open file for writing: ...` path).
+
+Mitigation: in native mode the X-Tension passes the output dir and input path
+to BE as **8.3 short paths** (`C:\xwfb\XWB21-~2\...`), and caps exported
+temp-file leaf names at 40 characters. The case-facing paths (evidence object,
+labels, Open output) stay long. If 8.3 name generation is disabled on the
+volume (`NtfsDisable8dot3NameCreation`), the Messages window says so and very
+long paths may still fail — shorten the case/install paths, or scan fewer
+deeply-named items. A one-line upstream fix (`find_last_of("/\\")`) would
+remove the need for this; not yet reported upstream.
+
 ## Current limitations
 
 See [ROADMAP.md](ROADMAP.md) for the planned work behind these.
