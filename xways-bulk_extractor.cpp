@@ -1207,6 +1207,31 @@ static bool IsDirectoryItem(LONG itemID) {
     return ok && (flags & XWF_ITEM_INFO_FLAG_DIRECTORY) != 0;
 }
 
+// v0.5.0: a "child object" is an item whose parent is a file, not a
+// directory (zip members, e-mail attachments, embedded objects). X-Ways only
+// delivers these when "Consider child objects of selected files" is ticked
+// in the Run X-Tensions dialog — the X-Tension can't read that checkbox, but
+// it can recognise the items and say so.
+static bool IsChildObject(LONG itemID) {
+    if (!XWF_GetItemParent) return false;
+    LONG parent = XWF_GetItemParent(itemID);
+    return parent >= 0 && !IsDirectoryItem(parent);
+}
+
+static std::wstring WithCommas(unsigned long long v) {
+    std::wstring d = std::to_wstring(v), out;
+    int c = 0;
+    for (size_t i = d.size(); i-- > 0;) {
+        out.insert(out.begin(), d[i]);
+        if (++c % 3 == 0 && i > 0) out.insert(out.begin(), L',');
+    }
+    return out;
+}
+
+// v0.5.0: set while the dialog is being created — the Scan target count is
+// deferred to WM_APP_COUNT so the dialog appears first ("Counting…").
+static bool g_scanTargetPending = false;
+
 static std::wstring HumanSize(UINT64 b) {
     static const wchar_t* kUnits[] = { L"bytes", L"KB", L"MB", L"GB", L"TB" };
     double v = (double)b; int i = 0;
@@ -1266,26 +1291,31 @@ static std::wstring DescribePathTarget(const std::wstring& rawPath) {
 
 static void UpdateScanTarget(HWND hDlg) {
     std::wstring text;
+    if (g_scanTargetPending) {
+        SetDlgItemTextW(hDlg, IDC_STATIC_SCAN_TARGET, L"Counting selected items\u2026");
+        return;
+    }
     if (IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_SELECTED) == BST_CHECKED) {
         UINT64 bytes = 0;
-        size_t dirs = 0;
+        size_t dirs = 0, empty = 0, children = 0;
         for (LONG id : g_run.selected) {
             if (IsDirectoryItem(id)) { ++dirs; continue; }
-            if (XWF_GetItemSize) {
-                INT64 sz = XWF_GetItemSize(id);
-                if (sz > 0) bytes += (UINT64)sz;
-            }
+            INT64 sz = XWF_GetItemSize ? XWF_GetItemSize(id) : 0;
+            if (sz <= 0) { ++empty; continue; }
+            bytes += (UINT64)sz;
+            if (IsChildObject(id)) ++children;
         }
-        const size_t files = g_run.selected.size() - dirs;
-        wchar_t buf[160];
-        if (dirs > 0)
-            swprintf_s(buf, L"%zu selected file%s \u2014 %s  (+ %zu director%s, skipped)",
-                       files, files == 1 ? L"" : L"s", HumanSize(bytes).c_str(),
-                       dirs, dirs == 1 ? L"y" : L"ies");
-        else
-            swprintf_s(buf, L"%zu selected file%s \u2014 %s",
-                       files, files == 1 ? L"" : L"s", HumanSize(bytes).c_str());
-        text = buf;
+        const size_t files = g_run.selected.size() - dirs - empty;
+        // "5,273 files — 524.6 MB (skipping 546 directories, 12 empty; 37 child objects of files included)"
+        text = WithCommas(files) + (files == 1 ? L" file" : L" files") + L" \u2014 " + HumanSize(bytes);
+        std::wstring extra;
+        if (dirs > 0)  extra += L"skipping " + WithCommas(dirs) + (dirs == 1 ? L" directory" : L" directories");
+        if (empty > 0) extra += (extra.empty() ? L"skipping " : L", ") + WithCommas(empty) + L" empty";
+        if (children > 0) {
+            if (!extra.empty()) extra += L"; ";
+            extra += WithCommas(children) + L" child object" + (children == 1 ? L"" : L"s") + L" of files included";
+        }
+        if (!extra.empty()) text += L"  (" + extra + L")";
     } else {
         // Active-EO and External modes both run whatever the path field holds
         // (the EO source is pre-filled into it), so describe the field.
@@ -1496,8 +1526,10 @@ static void InstallDlgTooltips(HWND hDlg) {
         { IDC_STATIC_WSL_VERSION,
           L"Version of the binary a Run would use, probed via --version." },
         { IDC_STATIC_SCAN_TARGET,
-          L"What a Run will feed to bulk_extractor, with its size. Directory counts are a bounded "
-          L"walk (50,000 files / 1.5 s) \u2014 a trailing + means there is more." },
+          L"What a Run will feed to bulk_extractor, with its size. Selected-items counts reflect "
+          L"exactly what X-Ways handed over (the filter and child-object options in the Run "
+          L"X-Tensions dialog already applied); directories and 0-byte files are skipped. External "
+          L"directory counts are a bounded walk (50,000 files / 1.5 s) \u2014 a trailing + means more." },
         { IDC_CHK_USE_WSL,
           L"Run a Linux bulk_extractor through WSL instead of the Windows binary. Windows paths are "
           L"translated to /mnt/<drive>/... automatically. Greyed out when WSL or a bulk_extractor "
@@ -1997,7 +2029,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             }
         }
 
+        g_scanTargetPending = true;           // v0.5.0: count after the dialog shows
         UpdateInputState(hDlg, s);
+        PostMessageW(hDlg, WM_APP_COUNT, 0, 0);
 
         // v0.4.0: helper-exe identity verification of the initial NATIVE
         // binary. WSL mode is exempt (the Linux binary can't be inspected from
@@ -2548,6 +2582,12 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         }
         (void)evt;
         return FALSE;
+    }
+    case WM_APP_COUNT: {
+        // v0.5.0: deferred Scan target count (dialog is visible now).
+        g_scanTargetPending = false;
+        UpdateScanTarget(hDlg);
+        return TRUE;
     }
     case WM_APP_STATUS: {
         wchar_t* text = (wchar_t*)lp;
@@ -3242,6 +3282,8 @@ struct ExportResult {
     int          virtualSkipped = 0;  // v0.2.4: virtual/unreadable items (e.g. Free space)
     int          taggedScanned  = 0;
     int          dirsSkipped    = 0;  // v0.5.0: directories in the selection (not exportable)
+    int          emptySkipped   = 0;  // v0.5.0: 0-byte files (nothing to scan)
+    int          childObjects   = 0;  // v0.5.0: exported items whose parent is a file
     UINT64       bytes          = 0;  // v0.5.0: total bytes exported
     bool         cancelled      = false;  // v0.5.0: analyst hit Cancel mid-export
 };
@@ -3271,7 +3313,7 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
         if (IsDirectoryItem(itemID)) { ++r.dirsSkipped; continue; }   // v0.5.0
         if (!XWF_GetItemSize) continue;
         INT64 sz = XWF_GetItemSize(itemID);
-        if (sz <= 0) continue;  // skip empty/unknown
+        if (sz <= 0) { ++r.emptySkipped; continue; }   // v0.5.0: 0-byte — nothing to scan
 
         const wchar_t* nm = XWF_GetItemName ? XWF_GetItemName(itemID) : L"";
         std::wstring leaf = SanitizeForFilename(nm ? nm : L"");
@@ -3289,6 +3331,7 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
         case ExportOutcome::Ok:
             ++r.exported;
             r.bytes += (UINT64)sz;
+            if (IsChildObject(itemID)) ++r.childObjects;
             // v0.5.0: no per-item "exported:" line — 5k+ Output-window writes
             // were most of the export wall-clock. Progress goes to the status
             // bar; a Messages summary line lands every 500 exported items.
@@ -3409,6 +3452,17 @@ static bool PrepareRunInput(const RunCtx& ctx, const Settings& s, RunPrep& prep)
             swprintf_s(buf, L"  (%d director%s in the selection skipped \u2014 bulk_extractor "
                             L"scans their files, not the folder entries)",
                        er.dirsSkipped, er.dirsSkipped == 1 ? L"y" : L"ies");
+            Log(buf);
+        }
+        if (er.emptySkipped > 0) {
+            swprintf_s(buf, L"  (%d empty (0-byte) file%s skipped)",
+                       er.emptySkipped, er.emptySkipped == 1 ? L"" : L"s");
+            Log(buf);
+        }
+        if (er.childObjects > 0) {
+            swprintf_s(buf, L"  (%d child object%s of selected files included \u2014 the "
+                            L"\"Consider child objects\" option in Run X-Tensions)",
+                       er.childObjects, er.childObjects == 1 ? L"" : L"s");
             Log(buf);
         }
         if (er.exportFailed > 0) {
@@ -3915,12 +3969,25 @@ LONG __stdcall XT_Prepare(HANDLE hVolume, HANDLE hEvidence, DWORD nOpType, void*
 }
 
 LONG __stdcall XT_ProcessItem(LONG nItemID, void*) {
-    if (g_run.selectionMode) g_run.selected.push_back(nItemID);
+    if (g_run.selectionMode) {
+        g_run.selected.push_back(nItemID);
+        // v0.5.0: a sign of life on big selections — X-Ways hands items over
+        // one callback at a time before the dialog can open.
+        if ((g_run.selected.size() % 2000) == 0) {
+            Log(L"collecting selected items from X-Ways\u2026 " +
+                WithCommas(g_run.selected.size()));
+        }
+    }
     return 0;
 }
 
 LONG __stdcall XT_Finalize(HANDLE, HANDLE, DWORD nOpType, void*) {
     if (nOpType == XT_ACTION_DBC && g_run.selectionMode) {
+        // v0.5.0: say what's about to happen — the dialog takes a few seconds
+        // to appear on first open (WSL + binary probes) and on big selections.
+        Log(L"received " + WithCommas(g_run.selected.size()) +
+            L" selected item(s) from X-Ways \u2014 opening the settings dialog "
+            L"(probing the bulk_extractor binary and WSL)\u2026");
         RunFlow(g_hMainWnd, g_run);
     }
     // 0x02 = ask X-Ways to save the volume snapshot (added v21.3 Preview 3).

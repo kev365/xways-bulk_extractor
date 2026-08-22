@@ -79,3 +79,6 @@
 //   WM_APP_DONE:   wParam  = 0 ok, 1 cancelled, 2 failed.
 #define WM_APP_STATUS   (WM_APP + 1)
 #define WM_APP_DONE     (WM_APP + 2)
+//   WM_APP_COUNT:  posted by WM_INITDIALOG so the Scan target count runs after
+//                  the dialog is visible ("Counting..." shows meanwhile).
+#define WM_APP_COUNT    (WM_APP + 3)
