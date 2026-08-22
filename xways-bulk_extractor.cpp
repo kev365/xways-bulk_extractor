@@ -255,6 +255,10 @@ static HWND    g_hMainWnd  = nullptr;
 static constexpr UINT_PTR  kElapsedTimerId = 0xBE14;
 static std::atomic<bool>   g_workerActive{false};
 static std::atomic<bool>   g_cancelRequested{false};
+// v0.5.0: Phase A (selected-items export) runs on the UI thread but pumps
+// messages between items; while it's in flight the dialog is locked like a
+// worker run, Cancel aborts the export, and the status bar shows progress.
+static std::atomic<bool>   g_exportActive{false};
 static std::thread         g_workerThread;   // joinable; see comment above
 static HWND                g_dlgHwnd = nullptr;
 static ULONGLONG           g_runStartTick = 0;
@@ -1309,6 +1313,8 @@ static const int kRunLockIds[] = {
 // Forward declaration — definition lives after the split run phases (the
 // worker lambda inside StartBeWorker calls ExecuteBeRun).
 static void StartBeWorker(HWND hDlg);
+static void SetRunControlsEnabled(HWND hDlg, BOOL enable);
+static void PumpDialogMessages(HWND hDlg);
 
 // Forward declaration — defined with the post-processing helpers below; the
 // dialog's Open-output button uses it too.
@@ -1361,7 +1367,7 @@ static void DrawStatusBar(const DRAWITEMSTRUCT* dis) {
     RECT rc = dis->rcItem;
     wchar_t txt[256] = {0};
     GetWindowTextW(dis->hwndItem, txt, 256);
-    const bool running  = g_workerActive.load();
+    const bool running  = g_workerActive.load() || g_exportActive.load();
     const bool rejected = g_helperRejected;
     const bool hasText  = txt[0] != 0;
 
@@ -2439,8 +2445,20 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             // extraction reads item bytes via XWF_OpenItem/Read and may tag
             // via XWF_Label -- none of that may run on the worker. On failure
             // the status line already carries the reason; stay idle.
+            // v0.5.0: Phase A pumps messages (selected-items export), so lock
+            // the dialog like a run and let Cancel abort it; unlock on any
+            // failure/cancel so the analyst can adjust and retry.
             g_workerPrep = RunPrep{};
-            if (!PrepareRunInput(g_workerCtx, g_workerSettings, g_workerPrep)) {
+            g_cancelRequested.store(false);
+            g_exportActive.store(true);
+            SetRunControlsEnabled(hDlg, FALSE);
+            const bool prepOk = PrepareRunInput(g_workerCtx, g_workerSettings, g_workerPrep);
+            g_exportActive.store(false);
+            if (!prepOk) {
+                SetRunControlsEnabled(hDlg, TRUE);
+                EnableWindow(GetDlgItem(hDlg, IDCANCEL), TRUE);
+                HWND hBar = GetDlgItem(hDlg, IDC_STATIC_BE_STATUS);
+                if (hBar) InvalidateRect(hBar, nullptr, FALSE);   // marquee -> final state
                 return TRUE;
             }
             if (g_workerPrep.didMutate) g_run.didMutate = true;
@@ -2449,6 +2467,17 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             return TRUE;
         }
         case IDCANCEL: {
+            // v0.5.0: during the Phase A export, Cancel aborts the export (the
+            // loop checks g_cancelRequested between items).
+            if (g_exportActive.load()) {
+                if (!g_cancelRequested.load()) {
+                    g_cancelRequested.store(true);
+                    EnableWindow(GetDlgItem(hDlg, IDCANCEL), FALSE);
+                    SetBeStatus(hDlg, L"Cancelling export\u2026");
+                    Log(L"Cancel requested \u2014 stopping the selected-items export\u2026");
+                }
+                return TRUE;
+            }
             // Phase 3: while a run is active, Cancel = cooperative abort.
             // First click sets g_cancelRequested; the worker's 100 ms wait
             // loop terminates the BE child and unwinds via WM_APP_DONE
@@ -2536,15 +2565,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         // Re-enable Run + settings + the scanner checkboxes (inverse of
         // StartBeWorker). IDCANCEL is re-enabled explicitly (it is not in
         // kRunLockIds and Phase 3's IDCANCEL abort disables it mid-cancel).
-        EnableWindow(GetDlgItem(hDlg, IDOK), TRUE);
-        for (int id : kRunLockIds) {
-            HWND h = GetDlgItem(hDlg, id);
-            if (h) EnableWindow(h, TRUE);
-        }
-        for (int i = 0; i < kNumScanners; ++i) {
-            HWND h = GetDlgItem(hDlg, IDC_SCANNER_BASE + i);
-            if (h) EnableWindow(h, TRUE);
-        }
+        SetRunControlsEnabled(hDlg, TRUE);
         EnableWindow(GetDlgItem(hDlg, IDCANCEL), TRUE);
 
         // Re-apply input-mode enable/disable logic (some controls are mode-gated).
@@ -2556,7 +2577,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         return TRUE;
     }
     case WM_CLOSE:
-        if (g_workerActive.load()) return TRUE;   // must Cancel first
+        if (g_workerActive.load() || g_exportActive.load()) return TRUE;   // must Cancel first
         EndDialog(hDlg, IDCANCEL);
         return TRUE;
     case WM_DESTROY:
@@ -3178,16 +3199,32 @@ struct ExportResult {
     int          exportFailed   = 0;
     int          virtualSkipped = 0;  // v0.2.4: virtual/unreadable items (e.g. Free space)
     int          taggedScanned  = 0;
+    UINT64       bytes          = 0;  // v0.5.0: total bytes exported
+    bool         cancelled      = false;  // v0.5.0: analyst hit Cancel mid-export
 };
+
+// v0.5.0: progress callback — called every few items with (done, total,
+// bytes); return false to abort the export. The dialog path uses it to drive
+// the status bar + message pump and to honour Cancel.
+typedef bool (*ExportProgressFn)(size_t done, size_t total, UINT64 bytes);
 
 static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
                                         const std::vector<LONG>& selected,
-                                        bool tagScanned) {
+                                        bool tagScanned,
+                                        ExportProgressFn progress = nullptr) {
     ExportResult r;
     r.tempDir = CreateUniqueTempDir(hEvidence, L"input");
     if (r.tempDir.empty()) return r;
 
+    const size_t total = selected.size();
+    size_t done = 0;
     for (LONG itemID : selected) {
+        ++done;
+        // v0.5.0: progress + cancel check every 16 items (cheap enough to keep
+        // the marquee moving, rare enough not to dominate small items).
+        if (progress && (done % 16 == 0 || done == total)) {
+            if (!progress(done, total, r.bytes)) { r.cancelled = true; break; }
+        }
         if (!XWF_GetItemSize) continue;
         INT64 sz = XWF_GetItemSize(itemID);
         if (sz <= 0) continue;  // skip empty/dir/unknown
@@ -3207,7 +3244,16 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
         switch (outcome) {
         case ExportOutcome::Ok:
             ++r.exported;
-            LogVerbose(L"  exported: " + fname);
+            r.bytes += (UINT64)sz;
+            // v0.5.0: no per-item "exported:" line — 5k+ Output-window writes
+            // were most of the export wall-clock. Progress goes to the status
+            // bar; a Messages summary line lands every 500 exported items.
+            if ((r.exported % 500) == 0) {
+                wchar_t pb[96];
+                swprintf_s(pb, L"  export progress: %d item(s), %s",
+                           r.exported, HumanSize(r.bytes).c_str());
+                Log(pb);
+            }
             // Tag the source item as "scanned" the moment we successfully
             // export it — this way even a partial run leaves an audit trail
             // showing which items were submitted to bulk_extractor.
@@ -3283,15 +3329,37 @@ static bool PrepareRunInput(const RunCtx& ctx, const Settings& s, RunPrep& prep)
         }
         Log(L"exporting selected items to temp dir...");
         PostWorkerStatus(L"Exporting selected items…");
-        ExportResult er = ExportSelectedItems(ctx.hVolume, ctx.hEvidence, ctx.selected, s.tagScanned);
+        // v0.5.0: progress -> status bar, pump the dialog so it repaints and
+        // Cancel works, abort when requested. No-op when no dialog is up.
+        ExportProgressFn progress = [](size_t done, size_t total, UINT64 bytes) -> bool {
+            if (g_dlgHwnd) {
+                wchar_t b[160];
+                swprintf_s(b, L"Exporting %zu / %zu selected items \u2014 %s",
+                           done, total, HumanSize(bytes).c_str());
+                SetBeStatus(g_dlgHwnd, b);
+                PumpDialogMessages(g_dlgHwnd);
+            }
+            return !g_cancelRequested.load();
+        };
+        ExportResult er = ExportSelectedItems(ctx.hVolume, ctx.hEvidence, ctx.selected,
+                                              s.tagScanned, progress);
+        if (er.cancelled) {
+            wchar_t cb[160];
+            swprintf_s(cb, L"export cancelled by user after %d item(s); removing temp dir",
+                       er.exported);
+            Log(cb);
+            if (!er.tempDir.empty()) DeleteDirRecursive(er.tempDir);
+            PostWorkerStatus(L"Cancelled.");
+            return false;
+        }
         if (er.tempDir.empty() || er.exported == 0) {
             Log(L"Failed to export selected items to temp dir.");
             PostWorkerStatus(L"Failed: could not export selected items.");
             return false;
         }
-        wchar_t buf[160];
-        swprintf_s(buf, L"exported %d item(s) to %s",
-                   er.exported, er.tempDir.c_str());
+        wchar_t buf[200];
+        swprintf_s(buf, L"exported %d item(s), %s, to %s",
+                   er.exported, HumanSize(er.bytes).c_str(), er.tempDir.c_str());
         Log(buf);
         if (er.exportFailed > 0) {
             swprintf_s(buf, L"  (%d failed to export)", er.exportFailed);
@@ -3501,22 +3569,42 @@ static void PostProcessRun(const Settings& s, const RunPrep& prep,
 // dialog stays open in a running state; the worker posts WM_APP_DONE when
 // finished and is joined there (P2). IDOK has already run Phase A and copied
 // the resolved inputs into g_workerSettings / g_workerPrep.
+// v0.5.0: lock/unlock every setting + Run. Cancel (IDCANCEL) stays enabled —
+// its semantics flip to abort while a phase is active. Used by the Phase A
+// export (IDOK), StartBeWorker, and WM_APP_DONE.
+static void SetRunControlsEnabled(HWND hDlg, BOOL enable) {
+    EnableWindow(GetDlgItem(hDlg, IDOK), enable);
+    for (int id : kRunLockIds) {
+        HWND h = GetDlgItem(hDlg, id);
+        if (h) EnableWindow(h, enable);
+    }
+    for (int i = 0; i < kNumScanners; ++i) {
+        HWND h = GetDlgItem(hDlg, IDC_SCANNER_BASE + i);
+        if (h) EnableWindow(h, enable);
+    }
+}
+
+// v0.5.0: drain the dialog's message queue so it repaints / reacts (status
+// bar, marquee, Cancel) while Phase A exports on the UI thread. Re-entrancy
+// is bounded: Run and every setting are disabled, WM_CLOSE is swallowed, and
+// IDCANCEL only sets g_cancelRequested while g_exportActive.
+static void PumpDialogMessages(HWND hDlg) {
+    MSG m;
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+        if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); return; }
+        if (!hDlg || !IsDialogMessageW(hDlg, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+}
+
 static void StartBeWorker(HWND hDlg) {
     g_workerActive.store(true);
     g_cancelRequested.store(false);     // clear stale state from any prior run
     g_runStartTick = GetTickCount64();
 
-    // Lock out settings + Run. Cancel (IDCANCEL) stays enabled; its label stays
-    // "Cancel" but its semantics flip to abort (handled in IDCANCEL, Phase 3).
-    EnableWindow(GetDlgItem(hDlg, IDOK), FALSE);
-    for (int id : kRunLockIds) {
-        HWND h = GetDlgItem(hDlg, id);
-        if (h) EnableWindow(h, FALSE);
-    }
-    for (int i = 0; i < kNumScanners; ++i) {
-        HWND h = GetDlgItem(hDlg, IDC_SCANNER_BASE + i);
-        if (h) EnableWindow(h, FALSE);
-    }
+    SetRunControlsEnabled(hDlg, FALSE);
     SetBeStatus(hDlg,
                     L"Running bulk_extractor… 00:00 (see console window)");
     SetTimer(hDlg, kElapsedTimerId, 100, nullptr);   // v0.5.0: 100 ms drives the marquee

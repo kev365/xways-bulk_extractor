@@ -79,8 +79,15 @@ detach it, and never move an `XWF_*` call into phase B.
   window, `hVolume` is NULL (21.4 SR-5 behavior) and the run is refused with
   an explanation.
 - Selected-items extraction happens on the UI thread before the worker
-  starts, so a huge right-click selection blocks the dialog during export —
-  the long BE run itself is async and cancellable.
+  starts (it must — XWF_OpenItem/Read stay on X-Ways' thread), but since
+  v0.5.0 it pumps messages every 16 items: the status bar shows
+  "Exporting N / total — size", the marquee runs, and Cancel aborts the
+  export (temp dir removed). The dialog is locked exactly like a worker run
+  while `g_exportActive` is set.
+- bulk_extractor exit 6 ("Disk write error ... probably full") on a
+  directory scan is the upstream MAX_PATH carved-filename bug — native mode
+  passes 8.3 short paths on the BE command line to dodge it (README "Known
+  issues").
 - `XT_Finalize` returns `0x02` ("save volume snapshot") when the run added
   labels or an evidence object.
 
