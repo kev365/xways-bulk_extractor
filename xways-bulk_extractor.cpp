@@ -309,6 +309,33 @@ static std::atomic<bool>   g_cancelRequested{false};
 // messages between items; while it's in flight the dialog is locked like a
 // worker run, Cancel aborts the export, and the status bar shows progress.
 static std::atomic<bool>   g_exportActive{false};
+
+// --- v0.5.0: scanner grid rebuild state -------------------------------------
+//   The grid is (re)built by RebuildScannerGrid whenever g_scanners changes.
+//   It lays out relative to the TEMPLATE geometry captured on the first call
+//   of each dialog instance, so repeated rebuilds never drift.
+struct ScannerGridTemplate {
+    bool  captured = false;
+    RECT  group{};                                   // client rect of IDC_GROUP_SCANNERS
+    int   dlgW = 0, dlgH = 0;                        // dialog window size
+    std::vector<std::pair<int, POINT>> below;        // id -> template top-left (client)
+};
+static ScannerGridTemplate g_gridTpl;
+static HWND g_dlgTooltip = nullptr;                  // TOOLTIPS_CLASS window; recreated on rebuild
+
+// Controls BELOW the Scanners group that move with its auto-fit. Reset/Toggle
+// are to the RIGHT (parallel) so they don't move; the Threads / Max recursion
+// pair is snapped separately (kSnapIds) to sit directly above Output handling.
+static const int kShiftIds[] = {
+    IDC_GROUP_OUTPUT,
+    IDC_LABEL_OUTPUT, IDC_EDIT_OUTPUT_DIR, IDC_BTN_BROWSE_OUTPUT,
+    IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
+    IDC_BTN_ABOUT, IDC_BTN_OPEN_OUTPUT, IDC_STATIC_BE_STATUS,
+    IDOK, IDCANCEL,
+};
+static const int kSnapIds[] = {
+    IDC_LABEL_THREADS, IDC_COMBO_THREADS, IDC_LABEL_MAXRECURSE, IDC_EDIT_MAXRECURSE,
+};
 static std::thread         g_workerThread;   // joinable; see comment above
 static HWND                g_dlgHwnd = nullptr;
 static ULONGLONG           g_runStartTick = 0;
@@ -1788,8 +1815,10 @@ static void AddTip(HWND tt, HWND hDlg, int ctlId, const wchar_t* text) {
     SendMessageW(tt, TTM_ADDTOOLW, 0, (LPARAM)&ti);
 }
 static void InstallDlgTooltips(HWND hDlg) {
+    if (g_dlgTooltip) { DestroyWindow(g_dlgTooltip); g_dlgTooltip = nullptr; }
     HWND tt = CreateDlgTooltips(hDlg);
     if (!tt) return;
+    g_dlgTooltip = tt;
     struct { int id; const wchar_t* tip; } const kTips[] = {
         { IDC_RADIO_INPUT_EVOIMAGE,
           L"Scan the active evidence object's backing source (E01 / raw image, or a directory-type "
@@ -1970,6 +1999,210 @@ static void FitSingleLineEdits(HWND hDlg, const int* ids, size_t count) {
     }
 }
 
+// --- v0.5.0: scanner grid (re)build ------------------------------------------
+static HFONT ScannerCheckboxFont(HWND hDlg) {
+    // 9pt for the dense grid (dialog is 10pt). Cached per process — a
+    // one-time GDI handle; acceptable.
+    static HFONT s_font = nullptr;
+    if (!s_font) {
+        LOGFONTW lf = {};
+        HDC hdc = GetDC(hDlg);
+        lf.lfHeight = -MulDiv(9, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+        ReleaseDC(hDlg, hdc);
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"MS Shell Dlg");
+        s_font = CreateFontIndirectW(&lf);
+    }
+    return s_font ? s_font : (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0);
+}
+
+static std::vector<bool> ReadScannerChecks(HWND hDlg) {
+    std::vector<bool> on(g_scanners.entries.size(), false);
+    for (size_t i = 0; i < on.size(); ++i)
+        on[i] = IsDlgButtonChecked(hDlg, IDC_SCANNER_BASE + (int)i) == BST_CHECKED;
+    return on;
+}
+
+// Carry checked state from one list to another BY NAME; names new to the
+// grid take the new list's default.
+static std::vector<bool> CarryScannerState(const ScannerList& oldL, const std::vector<bool>& oldOn,
+                                           const ScannerList& newL) {
+    std::vector<bool> on(newL.entries.size(), false);
+    for (size_t i = 0; i < newL.entries.size(); ++i) {
+        on[i] = newL.entries[i].defaultEnabled;
+        for (size_t j = 0; j < oldL.entries.size() && j < oldOn.size(); ++j) {
+            if (oldL.entries[j].name == newL.entries[i].name) { on[i] = oldOn[j]; break; }
+        }
+    }
+    return on;
+}
+
+// Destroys and re-creates the scanner checkboxes for g_scanners, lays them out
+// relative to the template geometry (captured on the first call per dialog
+// instance), resizes the group AND the dialog in either direction, re-snaps
+// Threads / Max recursion above the Output group, and re-installs tooltips.
+// `on` is parallel to g_scanners.entries (size mismatch -> defaults).
+static void RebuildScannerGrid(HWND hDlg, const std::vector<bool>& on) {
+    HWND grp = GetDlgItem(hDlg, IDC_GROUP_SCANNERS);
+    if (!grp) return;
+    auto clientRc = [&](HWND h, RECT& out) {
+        GetWindowRect(h, &out);
+        MapWindowPoints(HWND_DESKTOP, hDlg, (POINT*)&out, 2);
+    };
+
+    // 1) Capture the template once per dialog instance.
+    if (!g_gridTpl.captured) {
+        clientRc(grp, g_gridTpl.group);
+        RECT rd; GetWindowRect(hDlg, &rd);
+        g_gridTpl.dlgW = rd.right - rd.left;
+        g_gridTpl.dlgH = rd.bottom - rd.top;
+        g_gridTpl.below.clear();
+        auto cap = [&](int id) {
+            HWND h = GetDlgItem(hDlg, id);
+            if (!h) return;
+            RECT r; clientRc(h, r);
+            g_gridTpl.below.emplace_back(id, POINT{ r.left, r.top });
+        };
+        for (int id : kShiftIds) cap(id);
+        for (int id : kSnapIds)  cap(id);
+        g_gridTpl.captured = true;
+    }
+
+    // 2) Tear down the previous grid and restore the template geometry so the
+    //    math below always starts from the same place.
+    for (int id = IDC_SCANNER_BASE; id <= IDC_SCANNER_LAST; ++id) {
+        HWND h = GetDlgItem(hDlg, id);
+        if (h) DestroyWindow(h);
+    }
+    const RECT& tg = g_gridTpl.group;
+    SetWindowPos(grp, nullptr, tg.left, tg.top, tg.right - tg.left, tg.bottom - tg.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    for (const auto& kv : g_gridTpl.below) {
+        HWND h = GetDlgItem(hDlg, kv.first);
+        if (h) SetWindowPos(h, nullptr, kv.second.x, kv.second.y, 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    SetWindowPos(hDlg, nullptr, 0, 0, g_gridTpl.dlgW, g_gridTpl.dlgH,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    const POINT tl = { tg.left, tg.top };
+    const POINT br = { tg.right, tg.bottom };
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hDlg, GWLP_HINSTANCE);
+    HFONT cbFont = ScannerCheckboxFont(hDlg);
+
+    // 3) Metrics: padTop from the GROUPBOX's own (bold 11pt) title font so
+    //    the first row clears the title; rowH from the checkbox font.
+    int padTop = 22;
+    {
+        HDC hdc = GetDC(hDlg);
+        HFONT titleFont = (HFONT)SendMessageW(grp, WM_GETFONT, 0, 0);
+        if (hdc && titleFont) {
+            HFONT old = (HFONT)SelectObject(hdc, titleFont);
+            TEXTMETRICW tm = {};
+            if (GetTextMetricsW(hdc, &tm)) {
+                int derived = tm.tmHeight + 10;
+                if (derived > padTop) padTop = derived;
+            }
+            SelectObject(hdc, old);
+        }
+        if (hdc) ReleaseDC(hDlg, hdc);
+    }
+    const int padBot = 8, padLR = 12;
+    const int nCols  = 4;
+    const int nScanners   = (int)g_scanners.entries.size();
+    const int nRowsPerCol = (nScanners + nCols - 1) / nCols;
+    int rowH = 24;
+    {
+        HDC hdc = GetDC(hDlg);
+        if (hdc) {
+            HFONT old = (HFONT)SelectObject(hdc, cbFont);
+            TEXTMETRICW tm = {};
+            if (GetTextMetricsW(hdc, &tm)) rowH = tm.tmHeight + 4;
+            SelectObject(hdc, old);
+            ReleaseDC(hDlg, hdc);
+        }
+        if (rowH < 16) rowH = 16;
+    }
+
+    // 4) Create the checkboxes, column-major (alphabetical runs DOWN a column).
+    int innerW = (br.x - tl.x) - 2 * padLR;
+    if (innerW < nCols) innerW = nCols;
+    const int colW = innerW / nCols;
+    const int xs = tl.x + padLR;
+    const int ys = tl.y + padTop;
+    for (int i = 0; i < nScanners; ++i) {
+        const int row = nRowsPerCol ? (i % nRowsPerCol) : 0;
+        const int col = nRowsPerCol ? (i / nRowsPerCol) : 0;
+        HWND cb = CreateWindowExW(
+            0, L"BUTTON", g_scanners.entries[i].name.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            xs + col * colW, ys + row * rowH, colW - 4, rowH - 2,
+            hDlg, (HMENU)(INT_PTR)(IDC_SCANNER_BASE + i), hInst, nullptr);
+        if (cb) SendMessageW(cb, WM_SETFONT, (WPARAM)cbFont, TRUE);
+        const bool checked = (i < (int)on.size()) ? on[i] : g_scanners.entries[i].defaultEnabled;
+        CheckDlgButton(hDlg, IDC_SCANNER_BASE + i, checked ? BST_CHECKED : BST_UNCHECKED);
+    }
+
+    // 5) Auto-fit the group to its natural height and move everything below
+    //    by the difference — in EITHER direction (a longer discovered list
+    //    grows the dialog; the built-in 37 shrink it).
+    const int natural_h = padTop + nRowsPerCol * rowH + padBot;
+    const int actual_h  = br.y - tl.y;
+    const int delta     = actual_h - natural_h;          // >0 shrink, <0 grow
+    if (delta > 4 || delta < -4) {
+        SetWindowPos(grp, nullptr, 0, 0, br.x - tl.x, natural_h,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        for (int id : kShiftIds) {
+            HWND h = GetDlgItem(hDlg, id);
+            if (!h) continue;
+            RECT r; clientRc(h, r);
+            SetWindowPos(h, nullptr, r.left, r.top - delta, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        SetWindowPos(hDlg, nullptr, 0, 0, g_gridTpl.dlgW, g_gridTpl.dlgH - delta,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // 6) Snap Threads / Max recursion directly above the Output group
+    //    (never up into the Check/Uncheck all button).
+    {
+        auto idRc = [&](int id, RECT& out) -> bool {
+            HWND h = GetDlgItem(hDlg, id);
+            if (!h) return false;
+            clientRc(h, out);
+            return true;
+        };
+        auto moveBy = [&](int id, int dy) {
+            RECT r;
+            if (!idRc(id, r)) return;
+            SetWindowPos(GetDlgItem(hDlg, id), nullptr, r.left, r.top + dy, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        };
+        RECT rOut, rTog, rTC, rME;
+        if (idRc(IDC_GROUP_OUTPUT, rOut) && idRc(IDC_BTN_TOGGLE_ALL, rTog) &&
+            idRc(IDC_COMBO_THREADS, rTC) && idRc(IDC_EDIT_MAXRECURSE, rME)) {
+            const int pitch  = rME.top - rTC.top;
+            const int gapPx  = MulDiv(6, rME.bottom - rME.top, 12);
+            int meTop = rOut.top - gapPx - (rME.bottom - rME.top);
+            const int minTop = rTog.bottom + gapPx + pitch;
+            if (meTop < minTop) meTop = minTop;
+            const int dM = meTop - rME.top;
+            const int dT = (meTop - pitch) - rTC.top;
+            moveBy(IDC_EDIT_MAXRECURSE,  dM);
+            moveBy(IDC_LABEL_MAXRECURSE, dM);
+            moveBy(IDC_COMBO_THREADS,    dT);
+            moveBy(IDC_LABEL_THREADS,    dT);
+        }
+    }
+
+    // 7) Title reflects provenance; tooltips re-installed for the new controls.
+    SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS,
+                    g_scanners.discovered ? L"Scanners" : L"Scanners (built-in list)");
+    InstallDlgTooltips(hDlg);
+    InvalidateRect(hDlg, nullptr, TRUE);
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     static Settings* s = nullptr;
     switch (msg) {
@@ -2113,207 +2346,13 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             SendMessageW(cb, CB_SETCURSEL, (WPARAM)(want - 1), 0);
         }
 
-        // Scanner checkboxes — programmatically create AUTOCHECKBOX controls
-        // inside the IDC_GROUP_SCANNERS rect. Layout: 3 columns, ceil(N/3) rows.
-        //
-        // v0.2.6 fixed a DPI/dialog-unit mismatch where the GROUPBOX was
-        // DLU-sized (auto-scaled by Windows for DPI) but our checkboxes used
-        // a fixed `rowH` in screen pixels — leaving a huge empty gap below
-        // the last row on high-DPI displays. v0.2.6 onwards computes rowH
-        // dynamically from the rendered group rect, so it fills regardless
-        // of DPI or font size.
-        //
-        // v0.2.7 reverts to 3 columns now that v0.2.6's larger checkbox
-        // font (9pt) makes labels readable even with denser horizontal
-        // packing. The dialog's other controls also bumped to 10pt (.rc
-        // FONT directive) — the scanner area stays at 9pt for visual
-        // hierarchy ("section header text is larger than dense inner
-        // controls" — standard Win32 UX).
-        {
-            HWND grp = GetDlgItem(hDlg, IDC_GROUP_SCANNERS);
-            RECT rc; GetWindowRect(grp, &rc);
-            POINT tl = {rc.left,  rc.top   }; ScreenToClient(hDlg, &tl);
-            POINT br = {rc.right, rc.bottom}; ScreenToClient(hDlg, &br);
-            HFONT dlgFont = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0);
-            HINSTANCE hInst =
-                (HINSTANCE)GetWindowLongPtrW(hDlg, GWLP_HINSTANCE);
-
-            // Build a slightly larger font for the scanner checkboxes only.
-            // Cached statically — created once per process, reused across
-            // dialog opens. Slight one-time leak if the DLL unloads, but
-            // that's millis of GDI memory; acceptable.
-            static HFONT s_scannerFont = nullptr;
-            if (!s_scannerFont) {
-                LOGFONTW lf = {};
-                HDC hdc = GetDC(hDlg);
-                lf.lfHeight = -MulDiv(9, GetDeviceCaps(hdc, LOGPIXELSY), 72);
-                ReleaseDC(hDlg, hdc);
-                lf.lfWeight = FW_NORMAL;
-                lf.lfCharSet = DEFAULT_CHARSET;
-                wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"MS Shell Dlg");
-                s_scannerFont = CreateFontIndirectW(&lf);
-            }
-            HFONT cbFont = s_scannerFont ? s_scannerFont : dlgFont;
-
-            // padTop = clearance from GROUPBOX top edge to first checkbox row.
-            // Must accommodate the GROUPBOX title's full height (it renders
-            // INSIDE the GROUPBOX from y=0 down to y=tmHeight). v0.2.17
-            // bumped the title font to 11pt bold which is taller than the
-            // dialog font; v0.2.17's padTop calc used the dialog font and
-            // came out too small, leaving the first checkbox row crowding
-            // the title bottom. v0.2.18 measures using the GROUPBOX's actual
-            // current font (fetched via WM_GETFONT) — same font Windows uses
-            // to draw the title — so the math matches what gets rendered.
-            int padTop = 22;
-            {
-                HDC hdc = GetDC(hDlg);
-                HFONT titleFont = (HFONT)SendMessageW(grp, WM_GETFONT, 0, 0);
-                if (hdc && titleFont) {
-                    HFONT old = (HFONT)SelectObject(hdc, titleFont);
-                    TEXTMETRICW tm = {};
-                    if (GetTextMetricsW(hdc, &tm)) {
-                        // tmHeight covers ascender + descender; +10 px is the
-                        // empty band between title bottom and first checkbox.
-                        int derived = tm.tmHeight + 10;
-                        if (derived > padTop) padTop = derived;
-                    }
-                    SelectObject(hdc, old);
-                }
-                if (hdc) ReleaseDC(hDlg, hdc);
-            }
-
-            const int padBot = 8, padLR = 12;
-            const int nCols  = 4;   // v0.5.0: was 3
-            const int nScanners   = (int)g_scanners.entries.size();
-            const int nRowsPerCol = (nScanners + nCols - 1) / nCols;
-
-            // v0.2.8: derive rowH from the checkbox font's actual measured
-            // line height (TEXTMETRIC.tmHeight + small padding), not from
-            // groupHeight/nRows. The latter produced wide-spaced rows (or a
-            // clamped gap) on high-DPI displays where the GROUPBOX, sized in
-            // DLU, scaled up far more than fixed pixel measurements assumed.
-            int rowH = 24;  // fallback if metrics can't be obtained
-            {
-                HDC hdc = GetDC(hDlg);
-                if (hdc) {
-                    HFONT old = (HFONT)SelectObject(hdc, cbFont);
-                    TEXTMETRICW tm = {};
-                    if (GetTextMetricsW(hdc, &tm)) {
-                        rowH = tm.tmHeight + 4;  // v0.5.0: 4 px (was 6) — denser 4-col grid
-                    }
-                    SelectObject(hdc, old);
-                    ReleaseDC(hDlg, hdc);
-                }
-                if (rowH < 16) rowH = 16;  // legibility floor only
-            }
-
-            int innerW = (br.x - tl.x) - 2 * padLR;
-            if (innerW < nCols) innerW = nCols;
-            int colW = innerW / nCols;
-            int xs = tl.x + padLR;
-            int ys = tl.y + padTop;
-
-            for (int i = 0; i < (int)g_scanners.entries.size(); ++i) {
-                // v0.5.0: column-major — alphabetical order runs DOWN each
-                // column, then continues at the top of the next one.
-                int row = i % nRowsPerCol;
-                int col = i / nRowsPerCol;
-                int x = xs + col * colW;
-                int y = ys + row * rowH;
-                HWND cb = CreateWindowExW(
-                    0, L"BUTTON", g_scanners.entries[i].name.c_str(),
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                    x, y, colW - 4, rowH - 2,
-                    hDlg, (HMENU)(INT_PTR)(IDC_SCANNER_BASE + i),
-                    hInst, nullptr);
-                if (cb) SendMessageW(cb, WM_SETFONT, (WPARAM)cbFont, TRUE);
-                bool on = (i < (int)s->scannerOn.size())
-                    ? s->scannerOn[i] : g_scanners.entries[i].defaultEnabled;
-                CheckDlgButton(hDlg, IDC_SCANNER_BASE + i,
-                               on ? BST_CHECKED : BST_UNCHECKED);
-            }
-
-            // v0.2.8 auto-fit: shrink the scanner GROUPBOX to its natural
-            // height (12 rows of font-derived rowH + padding), then push
-            // everything below up + shrink the dialog by the saved delta.
-            // Eliminates the residual gap on any DPI/font combination.
-            int natural_h = padTop + nRowsPerCol * rowH + padBot;
-            int actual_h  = br.y - tl.y;
-            int delta     = actual_h - natural_h;
-            if (delta > 4) {
-                SetWindowPos(grp, nullptr, 0, 0, br.x - tl.x, natural_h,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                // Only controls BELOW the Scanner group need to shift up.
-                // Reset/Toggle are to the RIGHT (parallel) so they're not
-                // shifted. Tagging checkboxes are nested INSIDE the Input
-                // source group at the top, also no shift.
-                // v0.3.0: output-dir label/edit/browse moved INTO the
-                // Output handling group, so they're now below the scanner
-                // group and need to shift with it.
-                static const int kShiftIds[] = {
-                    IDC_GROUP_OUTPUT,
-                    IDC_LABEL_OUTPUT, IDC_EDIT_OUTPUT_DIR, IDC_BTN_BROWSE_OUTPUT,
-                    IDC_CHK_ADD_TO_CASE, IDC_CHK_OPEN_FOLDER,
-                    // (v0.5.0: Threads / Max recursion are NOT shifted — they
-                    // are snapped above the Output group after this block.)
-                    // v0.5.0 bottom bar: About / Open output / status line
-                    // moved down here with Run/Cancel.
-                    IDC_BTN_ABOUT, IDC_BTN_OPEN_OUTPUT, IDC_STATIC_BE_STATUS,
-                    IDOK, IDCANCEL,
-                };
-                for (int id : kShiftIds) {
-                    HWND h = GetDlgItem(hDlg, id);
-                    if (!h) continue;
-                    RECT r; GetWindowRect(h, &r);
-                    POINT p = {r.left, r.top};
-                    ScreenToClient(hDlg, &p);
-                    SetWindowPos(h, nullptr, p.x, p.y - delta, 0, 0,
-                                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                }
-                RECT rcDlg; GetWindowRect(hDlg, &rcDlg);
-                SetWindowPos(hDlg, nullptr, 0, 0,
-                             rcDlg.right  - rcDlg.left,
-                             rcDlg.bottom - rcDlg.top - delta,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-
-            // v0.5.0: snap the Threads / Max recursion pair (right column,
-            // under Check/Uncheck all) so it sits directly above the Output
-            // handling group wherever the auto-fit left that group. Their
-            // relative row pitch and label/control offsets come from the
-            // template; only the vertical position changes. Never pushed up
-            // into the Check/Uncheck all button.
-            {
-                auto clientRc = [&](int id, RECT& out) -> bool {
-                    HWND h = GetDlgItem(hDlg, id);
-                    if (!h) return false;
-                    GetWindowRect(h, &out);
-                    MapWindowPoints(HWND_DESKTOP, hDlg, (POINT*)&out, 2);
-                    return true;
-                };
-                auto moveBy = [&](int id, int dy) {
-                    RECT r;
-                    if (!clientRc(id, r)) return;
-                    SetWindowPos(GetDlgItem(hDlg, id), nullptr, r.left, r.top + dy, 0, 0,
-                                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                };
-                RECT rOut, rTog, rTC, rME;
-                if (clientRc(IDC_GROUP_OUTPUT, rOut) && clientRc(IDC_BTN_TOGGLE_ALL, rTog) &&
-                    clientRc(IDC_COMBO_THREADS, rTC) && clientRc(IDC_EDIT_MAXRECURSE, rME)) {
-                    const int pitch  = rME.top - rTC.top;            // template row spacing
-                    const int gapPx  = MulDiv(6, rME.bottom - rME.top, 12);  // ~6 DLU in px
-                    int meTop = rOut.top - gapPx - (rME.bottom - rME.top);
-                    int minTop = rTog.bottom + gapPx + pitch;        // stay below Toggle
-                    if (meTop < minTop) meTop = minTop;
-                    const int dM = meTop - rME.top;
-                    const int dT = (meTop - pitch) - rTC.top;
-                    moveBy(IDC_EDIT_MAXRECURSE,  dM);
-                    moveBy(IDC_LABEL_MAXRECURSE, dM);
-                    moveBy(IDC_COMBO_THREADS,    dT);
-                    moveBy(IDC_LABEL_THREADS,    dT);
-                }
-            }
-        }
+        // v0.5.0: the scanner grid is built (and later rebuilt when the binary
+        // changes) by RebuildScannerGrid, which also auto-fits the group,
+        // shifts everything below it, snaps Threads / Max recursion, and
+        // installs the tooltips.
+        g_gridTpl.captured = false;      // fresh template per dialog instance
+        g_dlgTooltip = nullptr;
+        RebuildScannerGrid(hDlg, s->scannerOn);
 
         g_scanTargetPending = true;           // v0.5.0: count after the dialog shows
         UpdateInputState(hDlg, s);
@@ -2362,9 +2401,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             FitSingleLineEdits(hDlg, kEdits, sizeof(kEdits) / sizeof(kEdits[0]));
         }
 
-        // v0.5.0: tooltips — after every control (incl. the programmatic
-        // scanner checkboxes) exists.
-        InstallDlgTooltips(hDlg);
+        // (v0.5.0: tooltips are installed by RebuildScannerGrid above.)
         return TRUE;
     }
     case WM_CTLCOLORSTATIC: {
@@ -2958,6 +2995,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         EndDialog(hDlg, IDCANCEL);
         return TRUE;
     case WM_DESTROY:
+        g_dlgTooltip = nullptr;          // child of the dialog — gone with it
+        g_gridTpl.captured = false;      // v0.5.0: fresh template next time
         // v0.4.0: tear down the Ctrl-poll + flash timers and reset the gesture
         // state so a re-opened dialog starts clean. The bold font is process-
         // cached (reused across opens), so it's left alive intentionally.
