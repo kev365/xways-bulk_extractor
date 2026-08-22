@@ -721,6 +721,14 @@ static bool SaveCfg(const std::wstring& path, const CfgValues& cfg) {
     o += L"# (`bulk_extractor -h`) each time the dialog opens. Only scanners you changed\r\n";
     o += L"# from that binary's OWN defaults are listed here, by name, comma-separated.\r\n";
     o += L"# Names the binary doesn't know are ignored (a line appears in Messages).\r\n";
+    if (g_scanners.discovered && !g_scanners.entries.empty()) {
+        // Informational only (not read back): what the binary reported when
+        // this file was written, so the lists below can be read in context.
+        std::wstring all;
+        for (const auto& e : g_scanners.entries) { if (!all.empty()) all += L","; all += e.name; }
+        o += L"# discovered from " + std::wstring(g_scanners.wsl ? L"WSL " : L"") + g_scanners.binary + L":\r\n";
+        o += L"#   " + all + L"\r\n";
+    }
     o += L"scanners_enable=";  o += joinNames(cfg.scanners_enable);  o += L"\r\n";
     o += L"scanners_disable="; o += joinNames(cfg.scanners_disable); o += L"\r\n\r\n";
 
@@ -2337,7 +2345,25 @@ static void ApplyCfgScannerOverrides(const ScannerList& list, std::vector<bool>&
     apply(disable, false, L"scanners_disable");
 }
 
+static std::wstring PathLeaf(const std::wstring& p) {
+    size_t i = p.find_last_of(L"\\/");
+    return (i == std::wstring::npos) ? p : p.substr(i + 1);
+}
+
 static void ApplyScannerList(HWND hDlg, Settings* s, const ScannerList& list) {
+    // Status bar: the outcome (the probe start is announced by the requester).
+    {
+        wchar_t sb[200];
+        if (list.discovered) {
+            size_t onCount = 0;
+            for (const auto& e : list.entries) if (e.defaultEnabled) ++onCount;
+            swprintf_s(sb, L"%zu scanners discovered from %s (%zu on by default)",
+                       list.entries.size(), PathLeaf(list.binary).c_str(), onCount);
+        } else {
+            swprintf_s(sb, L"Built-in scanner list (%s)", list.failReason.c_str());
+        }
+        SetBeStatus(hDlg, sb);
+    }
     std::vector<bool> oldOn = ReadScannerChecks(hDlg);
     std::vector<bool> newOn = CarryScannerState(g_scanners, oldOn, list);
     std::vector<std::wstring> targets;
@@ -2387,6 +2413,11 @@ static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std:
         SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS, L"Scanners (discovering\u2026)");
         UpdateWindow(GetDlgItem(hDlg, IDC_GROUP_SCANNERS));
         Log(L"scanner list: probing " + path + L" (-h / -H)\u2026");
+        SetBeStatus(hDlg, (L"Discovering scanners from " + PathLeaf(path) + L"\u2026").c_str());
+        {
+            HWND hBar = GetDlgItem(hDlg, IDC_STATIC_BE_STATUS);
+            if (hBar) UpdateWindow(hBar);
+        }
         ApplyScannerList(hDlg, s, ProbeScanners(false, path));
         return;
     }
@@ -2395,6 +2426,7 @@ static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std:
     if (!g_wslDetectDone.load()) return;
     SetDlgItemTextW(hDlg, IDC_GROUP_SCANNERS, L"Scanners (discovering\u2026)");
     Log(L"scanner list: probing WSL " + path + L" (-h / -H) in the background\u2026");
+    SetBeStatus(hDlg, (L"Discovering scanners from WSL " + PathLeaf(path) + L"\u2026 (background)").c_str());
     const unsigned gen = g_scanProbeGen.fetch_add(1) + 1;
     if (g_scanProbeRunning.load()) {
         g_scanProbePending = true;
