@@ -4109,13 +4109,57 @@ struct ExportResult {
 // the status bar + message pump and to honour Cancel.
 typedef bool (*ExportProgressFn)(size_t done, size_t total, UINT64 bytes);
 
+// v0.5.0: how long may an exported file NAME be so that bulk_extractor's
+// carved-file paths stay under MAX_PATH? BE (2.2.0, Windows) names carved
+// files after the full input path; the evtx scanner embeds it TWICE plus a
+// ~40-char suffix — the worst case seen, and the one this budget is sized
+// for. Measured from the real 8.3 short forms of the output dir and the
+// export temp dir (the run passes exactly those to BE for directory inputs):
+//
+//   <outShort>\evtx_carved\000\   +  2 x (<inShort>_ + <name> + ____-0)  +  suffix
+//
+// Returns the cap for <name> (may be small; never below 0). `wsl` runs are
+// not subject to MAX_PATH on the Linux side, so they get no cap.
+static size_t ExportNameBudget(const std::wstring& outputDir, const std::wstring& tempDir,
+                               bool wsl, std::wstring& outNote) {
+    if (wsl) return 4096;
+    // The output dir may not exist yet — create it so its short form is known
+    // (BE requires the dir to exist or be creatable anyway; empty is fine).
+    if (!outputDir.empty() && !DirExists(outputDir)) SHCreateDirectoryExW(nullptr, outputDir.c_str(), nullptr);
+    const std::wstring outShort = ShortPathForCmdline(outputDir);
+    const std::wstring inShort  = ShortPathForCmdline(tempDir);
+    const int kMaxPath   = 259;
+    const int kSubdir    = (int)wcslen(L"\\evtx_carved\\000\\");
+    const int kSuffix    = 40;            // "_valid_header_NNchunks_NNactual.evtx"
+    const int perCopy    = (int)inShort.size() + 1 /*_*/ + 6 /*____-0*/;
+    const int budget     = kMaxPath - (int)outShort.size() - kSubdir - kSuffix - 2 * perCopy;
+    const int nameCap    = budget / 2;    // the name appears in both copies
+    wchar_t note[400];
+    swprintf_s(note, L"carved-path budget: output %zu + input %zu chars (8.3 forms) \u2192 exported file names capped at %d chars",
+               outShort.size(), inShort.size(), nameCap < 0 ? 0 : nameCap);
+    outNote = note;
+    return nameCap < 0 ? 0 : (size_t)nameCap;
+}
+
 static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
                                         const std::vector<LONG>& selected,
                                         bool tagScanned,
-                                        ExportProgressFn progress = nullptr) {
+                                        ExportProgressFn progress = nullptr,
+                                        const std::wstring& outputDir = std::wstring(),
+                                        bool wsl = false) {
     ExportResult r;
     r.tempDir = CreateUniqueTempDir(hEvidence, L"input");
     if (r.tempDir.empty()) return r;
+
+    // v0.5.0: size the exported file names to the carved-path budget.
+    std::wstring budgetNote;
+    const size_t nameCap = ExportNameBudget(outputDir, r.tempDir, wsl, budgetNote);
+    Log(budgetNote);
+    if (nameCap < 20) {
+        Log(L"warning: the output and/or temp directory paths are so long that bulk_extractor's carved-file "
+            L"names may exceed MAX_PATH (exit 6 \"disk write error\") — choose a shorter output directory");
+    }
+    size_t leafTruncated = 0;
 
     const size_t total = selected.size();
     size_t done = 0;
@@ -4133,13 +4177,22 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
 
         const wchar_t* nm = XWF_GetItemName ? XWF_GetItemName(itemID) : L"";
         std::wstring leaf = SanitizeForFilename(nm ? nm : L"");
-        // Cap leaf length to keep paths short — BE embeds this whole file
-        // name in every carved-file name it derives from it (v0.5.0: 40, was 64).
+        // Cap the leaf so the whole name fits the carved-path budget — BE
+        // embeds this file name in every carved-file name it derives from it
+        // (twice, for evtx). The item ID is the key for hit labelling; the
+        // leaf is only there for readability and is the part we shorten.
         if (leaf.size() > 40) leaf = leaf.substr(0, 40);
-
         wchar_t prefix[32];
-        swprintf_s(prefix, L"xwitem_%ld_", itemID);
-        std::wstring fname = std::wstring(prefix) + leaf + L".bin";
+        swprintf_s(prefix, L"xwitem_%ld", itemID);
+        {
+            const size_t fixedLen = wcslen(prefix) + 4 /*.bin*/;
+            if (fixedLen + 1 + leaf.size() > nameCap) {
+                const size_t room = nameCap > fixedLen + 1 ? nameCap - fixedLen - 1 : 0;
+                if (room < 3) leaf.clear(); else leaf = leaf.substr(0, room);
+                ++leafTruncated;
+            }
+        }
+        std::wstring fname = std::wstring(prefix) + (leaf.empty() ? L"" : L"_" + leaf) + L".bin";
         std::wstring dest  = r.tempDir + L"\\" + fname;
 
         ExportOutcome outcome = ExportItemToFile(hVolume, itemID, dest);
@@ -4178,6 +4231,12 @@ static ExportResult ExportSelectedItems(HANDLE hVolume, HANDLE hEvidence,
             Log(L"  export FAILED: " + fname);
             break;
         }
+    }
+    if (leafTruncated) {
+        wchar_t tb[200];
+        swprintf_s(tb, L"  (%zu exported file name(s) shortened to fit bulk_extractor's carved-path budget; item IDs kept)",
+                   leafTruncated);
+        Log(tb);
     }
     return r;
 }
@@ -4245,7 +4304,7 @@ static bool PrepareRunInput(const RunCtx& ctx, const Settings& s, RunPrep& prep)
             return !g_cancelRequested.load();
         };
         ExportResult er = ExportSelectedItems(ctx.hVolume, ctx.hEvidence, ctx.selected,
-                                              s.tagScanned, progress);
+                                              s.tagScanned, progress, s.outputDir, s.useWsl);
         if (er.cancelled) {
             wchar_t cb[160];
             swprintf_s(cb, L"export cancelled by user after %d item(s); removing temp dir",
