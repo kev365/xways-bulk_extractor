@@ -1349,8 +1349,15 @@ static void ShowHelperRejection(HWND hDlg, const std::wstring& path,
     // No valid helper -> Run can't be useful.
     EnableWindow(GetDlgItem(hDlg, IDOK), FALSE);
 
-    Log(L"REJECTED bulk_extractor binary (" + path + L") — " + detail);
-    (void)detail;
+    // Log once per (path, reason): the dialog re-checks on open, focus changes
+    // and mode toggles, and the verdict is cached — repeating the line would
+    // read as if the file were being re-examined.
+    static std::wstring s_lastLogged;
+    const std::wstring key = path + L"|" + detail;
+    if (key != s_lastLogged) {
+        s_lastLogged = key;
+        Log(L"REJECTED bulk_extractor binary (" + path + L") — " + detail);
+    }
 }
 
 static void ClearHelperRejection(HWND hDlg) {
@@ -2509,7 +2516,8 @@ static void RequestScannerDiscovery(HWND hDlg, Settings* s, bool wsl, const std:
         // v0.5.0: never launch a binary the identity gate rejects (or that is
         // not even a console program) just to ask it for its scanner list.
         std::wstring gateDetail;
-        if (g_helperRejected || !VerifyHelperIdentity(path, kHelperIdentityNeedle, gateDetail)) {
+        const bool gateOk = VerifyHelperIdentity(path, kHelperIdentityNeedle, gateDetail);  // cached
+        if (g_helperRejected || !gateOk) {
             if (!g_scanners.discovered && g_scanners.wsl == wsl && g_scanners.binary == path) return;
             ScannerList fb = BuiltinScannerList();
             fb.wsl = wsl; fb.binary = path;
