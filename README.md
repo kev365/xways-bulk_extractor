@@ -13,6 +13,9 @@ Wraps Simson Garfinkel's [bulk_extractor](https://github.com/simsong/bulk_extrac
   - `base16` was **not** removed (the release note about the "stale lightgrep base16 scanner" refers to internal code) and the new `--dedupe-mode` defaults to legacy behavior — both verified, no changes needed.
   - **Output-dir caveat**: 2.2.0 no longer refuses a non-empty output dir; rerunning into a completed run's dir exits 0 having silently processed nothing (its restart logic sees the finished `report.xml`). Keep using a fresh dir per run — the suggested timestamped default already does this.
 - **Output dir re-stamped on every Run.** The auto-suggested `bulk_extractor_<stamp>` dir used to be timestamped once at dialog open, so a second Run in the same dialog session reused the first run's dir — pre-2.2.0 BE refuses that loudly; BE 2.2.0 silently no-ops (exit 0, nothing processed — observed live). Run now detects a previously-used auto-suggested dir and swaps in a fresh timestamp (with a same-second collision guard). Analyst-typed custom paths are never rewritten.
+- **Scanner list discovered from the binary.** The Scanners checklist is no longer a hard-coded table: on dialog open (and whenever the binary changes — Browse, typed path, WSL toggle) the X-Tension runs the selected binary's `-h` for names + default states and `-H` for tooltip descriptions, so new upstream scanners appear without an update and `-e`/`-x` is never emitted for a scanner the binary lacks. Native probes are synchronous (~0.2 s); WSL probes run in the background ("Scanners (discovering…)"). The built-in table is only a fallback ("Scanners (built-in list)") when the probe fails, with the reason logged.
+- **Scanner toggles persist.** Ctrl+Run now writes `scanners_enable=` / `scanners_disable=` — by name, and only where you differ from the selected binary's own defaults — so a BE upgrade doesn't drag stale defaults along. Unknown names are ignored with a Messages line.
+- **Extra arguments field.** Free-form options appended verbatim after the scanner flags and `-R`, before the input path (e.g. `-S jpeg_carve_mode=2`, `--dedupe-mode 0`, `-f <regex>`); persisted as `extra_args=`. Run warns if it contains an option the dialog already sets.
 - **X-Tension-manager compatibility layer removed** (that project is retired); the DLL now exports only the standard `XT_*` entry points, and carries a proper `VERSIONINFO` resource.
 
 ## v0.4.0-beta changes (2026-06-06)
@@ -141,9 +144,9 @@ The Windows side ships BE 2.0.2 (bundled binary) and the WSL side runs whatever 
 
 - **Cmdline flags** — `-o`, `-j`, `-M`, `-R`, `-e`, `-x` all behave the same as 2.0.x. No changes needed.
 - **New `*_carved` feature files in 2.1.x** — `ntfslogfile_carved`, `ntfsmft_carved`, `ntfsusn_carved`, `winpe_carved` appear alongside the parent recorders. These surface as `bulk_extractor: ntfslogfile_carved` etc. via the per-scanner-label code, which derives labels from feature filenames — no `FeatureToScanner` table change required.
-- **Scanner toggle list** — `kScanners` was built against 2.0.2's 35 scanners; 2.1.1 keeps the same set, so the checkbox grid covers it. (2.2.0 added `vin` and `rtti` — both now in the checklist, see the 2.2.0 section above.) Scanners a future BE adds before the list is updated simply don't appear as checkboxes — they run with their BE-side default and emit feature files normally; the only consequence is the analyst can't toggle them from the dialog. Detect with: diff `bulk_extractor -h` against `kScanners` and append entries.
+- **Scanner toggle list** — discovered from the selected binary since v0.5.0 (`-h`), so a 2.1.1 binary shows its 36 scanners and a 2.2.0 binary its 37; the built-in table is only a fallback. *(Historical: the table was built against 2.0.2's 35 scanners and verified unchanged through 2.1.1.)*
 
-If a feature filename appears that you want to *suppress* via the dialog (rather than just label after the fact), add it to `kScanners`. Otherwise it'll surface as a label transparently and there's nothing to do.
+Feature files the label mapper doesn't know surface as labels under their own name (`FeatureToScanner` falls through), so nothing needs maintaining when BE adds feature outputs.
 
 ## v0.2.4 changes (2026-05-03 — followups from first end-to-end run)
 
@@ -165,7 +168,8 @@ If a feature filename appears that you want to *suppress* via the dialog (rather
 - **bulk_extractor binary** — auto-filled with the bundled binary path; overridable here, or via `bulk_extractor.cfg` `be_binary=...`.
 - **Threads (-j)** — dropdown listing 1..N where N = system cores; default selected = max(1, N/2) so the analyst keeps headroom for X-Ways and the OS while BE is grinding.
 - **Max recursion (-M)** — defaults to 12 (BE's own default).
-- **Scanners** — one checkbox per BE scanner (37 total in 3 columns as of BE 2.2.0), pre-checked to match BE's defaults. Toggle any to override; "Reset to defaults" restores BE defaults. The X-Tension only emits `-e` / `-x` flags for scanners that diverge from defaults, so the cmdline stays readable in the messages-window log.
+- **Scanners** — one checkbox per scanner **reported by the selected binary** (`bulk_extractor -h`; 37 for BE 2.2.0, 4 columns, alphabetical down each column), pre-checked to that binary's own defaults, tooltips from `-H`. "Reset to defaults" restores them. The X-Tension only emits `-e` / `-x` for scanners that diverge from the binary's defaults, so the cmdline stays readable and a flag is never sent for a scanner the binary doesn't know. Title reads "Scanners (built-in list)" if the probe failed, "Scanners (discovering…)" while a WSL probe runs.
+- **Extra arguments** — appended verbatim after the scanner flags and `-R`, before the input path; for `-S` options, `--dedupe-mode`, `-f`/`-F` find patterns, and future flags. Run warns about `-o/-e/-x/-R/-j/-M` collisions.
 - **Output handling** — four checkboxes:
   - Add output dir as evidence (default on).
   - Open in Explorer when done.
@@ -245,6 +249,14 @@ default_output_dir=E:\BE_output
 # xwitem_*.bin files post-run (e.g. to cross-check BE feature hits against
 # the raw bytes).
 keep_temp_dir=false
+
+# v0.5.0: scanner toggles by NAME, only where they differ from the selected
+# binary's own defaults (written by Ctrl+Run). Unknown names are ignored.
+scanners_enable=base16,wordlist
+scanners_disable=vcard_carved
+
+# v0.5.0: free-form extra bulk_extractor options (spliced before the input path)
+extra_args=-S jpeg_carve_mode=2
 ```
 
 ## Bundled bulk_extractor version

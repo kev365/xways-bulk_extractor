@@ -110,15 +110,14 @@ with no warning. The suggested-fresh-subdir default already avoids this;
 the pre-flight check closes the manual-path hole, optionally offering
 BE 2.2.0's `-Z` (zap = wipe output dir first) behind a confirmation.
 
-### P3 — Scanner-list maintenance vs new BE versions
+### ~~P3 — Scanner-list maintenance vs new BE versions~~ — resolved in v0.5.0
 
-When a new BE ships, diff `bulk_extractor -h` (and `-H` for feature names)
-against `kScanners` and append new entries. History: built against BE 2.0.2's
-35 scanners, verified unchanged through 2.1.1; BE 2.2.0 added `vin` and
-`rtti` (tracked in the P1 integration item above). New scanners a future BE
-adds before we catch up run with their BE-side default and their feature
-files still get labeled via the `FeatureToScanner` fall-through — the only
-loss is the analyst can't toggle them from the dialog.
+The checklist is now discovered from the selected binary (`-h` / `-H`), so
+there is nothing to append when a new BE ships; the built-in table survives
+only as the fallback when the probe fails. Free-form **Extra arguments**
+cover future options without an X-Tension change. Remaining maintenance:
+`FeatureToScanner` (label naming) when BE adds feature files whose names
+don't match their scanner — unknown names already fall through unharmed.
 
 ## Shipped
 

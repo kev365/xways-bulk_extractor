@@ -163,7 +163,7 @@ static const ScannerInfo kScanners[] = {
     {L"sqlite",         true , L"Scans for and carves SQLite3 databases"},
     {L"utmp",           true , L"Scans for utmp/wtmp login records"},
     {L"vcard_carved",   true , L"Scans for and carves vCard data"},
-    {L"vin",            true , L"Scans for Vehicle Identification Numbers (BE 2.2.0+)"},   // BE 2.2.0+: Vehicle Identification Numbers
+    {L"vin",            true , L"Scans for Vehicle Identification Numbers"},   // present since BE 2.1.x
     {L"windirs",        true , L"Scans Microsoft directory structures (FAT32 directory entries and NTFS MFT records)"},
     {L"winlnk",         true , L"Searches for Windows LNK (shortcut) files"},
     {L"winpe",          true , L"Scans for Windows PE (executable) headers"},

@@ -66,6 +66,17 @@ detach it, and never move an `XWF_*` call into phase B.
 (intentionally **not** written on save — output follows the case:
 `<caseRoot>\xways-bulk_extractor\…`).
 
+## Scanner list (v0.5.0)
+
+Discovered at runtime from the selected binary: `ProbeScanners` runs `-h`
+(names + defaults; note `-h` exits 1 while printing) and `-H` (descriptions),
+cached per (mode, path); `kScanners[]` is only the fallback. Native probes are
+synchronous; WSL probes run on `g_scanProbeThread` with a generation counter
+and are applied by the 100 ms timer (`PollScanProbe`) — never touch the HWND
+from that thread. `RebuildScannerGrid` is the only thing allowed to replace
+`g_scanners` (tooltips hold pointers into it). The run uses the IDOK snapshot
+`Settings::scannerRef`, never `g_scanners`.
+
 ## Gotchas / notes
 
 - A reused (non-empty) output dir is analyst error: pre-2.2.0 BE refuses to
