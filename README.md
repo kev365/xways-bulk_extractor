@@ -328,6 +328,16 @@ unchanged, and BE writes nothing into the working directory. The one cost is
 that BE's own `report.xml` records `<image_filename>` as the relative path, so
 the X-Tension logs the absolute input next to the command line.
 
+Verified at scale 2026-08-23 on a 110,806-file directory scan: **0 disk-write
+exceptions**, longest carved path 203 characters (56 under the limit). Note the
+worst case is not `evtx_carved` but `zip_carved`, which appends the path *inside
+the archive* to the carved name (`…-ZIP-0_tools_chocolateyInstall_helpers_…`) —
+that suffix is bounded only by BE's `zip_name_len_max` (default 1024), so a
+deeply-nested archive entry remains the one shape that could still exceed
+`MAX_PATH`. The export budget below assumes a ~40-character suffix, which is the
+evtx worst case, not the zip one; the headroom the relative input buys is what
+covers the difference.
+
 Belt and braces: the output directory is still passed in 8.3 short form, and
 exported temp-file leaf names are still capped — but the cap is now computed
 against the *relative* input, so it lands around 70 characters instead of 26
