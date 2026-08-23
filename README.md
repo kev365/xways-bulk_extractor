@@ -49,8 +49,8 @@ xtensions\                                  <- copied into <X-Ways install>\xten
 
 ### Sourcing `bulk_extractor64.exe`
 
-The ~97 MB binary is **not committed to this repo** (`.gitignore`'d to keep the
-clone size sane); fresh checkouts need to download it once. Since **v2.2.0**
+The ~97 MB binary is **not included in this repo or its releases** — download
+it once from upstream. Since **v2.2.0**
 (2026-08-18) upstream publishes an official precompiled Windows binary with
 each GitHub release — verify its SHA-256 against the release's `SHA256SUMS`:
 
