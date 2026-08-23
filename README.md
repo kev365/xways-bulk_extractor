@@ -2,49 +2,163 @@
 
 Wraps Simson Garfinkel's [bulk_extractor](https://github.com/simsong/bulk_extractor) as an X-Ways Forensics X-Tension. Exposes a settings dialog (parented to X-Ways' main window), runs `bulk_extractor64.exe` (Windows) **or `bulk_extractor` via WSL** against the chosen input, and (optionally) feeds the output back into X-Ways.
 
-> **Status: 0.5.0 — first stable release.** Exercised end-to-end on real cases, including a 110,000-item selected-items run and both native and WSL bulk_extractor 2.2.0 binaries. Known gaps are listed under [Current limitations](#current-limitations).
+> **Status: 0.5.0 — first stable release.** Exercised end-to-end on real cases, including a 110,000-item selected-items run and both native and WSL bulk_extractor 2.2.0 binaries. Known gaps are listed under [Current limitations](#current-limitations); the release history is in [CHANGELOG.md](CHANGELOG.md).
 
-## v0.5.0 changes (2026-08-23 — in-DLL Cancel, BE 2.2.0, dynamic scanners)
+## What's in the dialog
 
-- **Real in-DLL Cancel.** The BE run moved off the UI thread onto a joinable worker with a three-phase split that keeps every `XWF_*` call on X-Ways' own thread: input prep runs in the Run handler, only the BE subprocess runs on the worker (cancellable — the Cancel button terminates the child within ~100 ms), and post-processing (evidence object, labels, temp cleanup) runs back on the UI thread when the worker reports done. The dialog stays responsive throughout; closing it mid-run is blocked, and Cancel shows a "Cancelling…" status until the child is reaped.
-- **bulk_extractor 2.2.0 support** (all findings verified against the official 2.2.0 Windows release binary, not just the release notes):
-  - Two new scanner checkboxes: **`vin`** (Vehicle Identification Numbers) and **`rtti`** (RawTherapee 8-bit thumbnail carver) — both enabled by default upstream, checklist now 37 scanners. Note: unchecking either while running a pre-2.2.0 BE fails the run (BE hard-errors on `-x` of a name it doesn't know: `no such scanner`).
-  - 2.2.0 is the **first upstream release with an official precompiled Windows binary** (`bulk_extractor64.exe`) — and it reads E01 images and raw devices natively, so WSL is no longer required for E01 or ≥2.1 features. The MinGW-built exe has an empty PE `VERSIONINFO`; the identity gate passes it via its `--version` banner check.
-  - `base16` was **not** removed (the release note about the "stale lightgrep base16 scanner" refers to internal code) and the new `--dedupe-mode` defaults to legacy behavior — both verified, no changes needed.
-  - **Output-dir caveat**: 2.2.0 no longer refuses a non-empty output dir; rerunning into a completed run's dir exits 0 having silently processed nothing (its restart logic sees the finished `report.xml`). Keep using a fresh dir per run — the suggested timestamped default already does this.
-- **Output dir re-stamped on every Run.** The auto-suggested `bulk_extractor_<stamp>` dir used to be timestamped once at dialog open, so a second Run in the same dialog session reused the first run's dir — pre-2.2.0 BE refuses that loudly; BE 2.2.0 silently no-ops (exit 0, nothing processed — observed live). Run now detects a previously-used auto-suggested dir and swaps in a fresh timestamp (with a same-second collision guard). Analyst-typed custom paths are never rewritten.
-- **Scanner list discovered from the binary.** The Scanners checklist is no longer a hard-coded table: on dialog open (and whenever the binary changes — Browse, typed path, WSL toggle) the X-Tension runs the selected binary's `-h` for names + default states and `-H` for tooltip descriptions, so new upstream scanners appear without an update and `-e`/`-x` is never emitted for a scanner the binary lacks. Native probes are synchronous (~0.2 s); WSL probes run in the background ("Scanners (discovering…)"). The built-in table is only a fallback ("Scanners (built-in list)") when the probe fails, with the reason logged.
-- **Scanner toggles persist.** Ctrl+Run now writes `scanners_enable=` / `scanners_disable=` — by name, and only where you differ from the selected binary's own defaults — so a BE upgrade doesn't drag stale defaults along. Unknown names are ignored with a Messages line.
-- **Extra arguments field.** Free-form options appended verbatim after the scanner flags and `-R`, before the input path (e.g. `-S jpeg_carve_mode=2`, `--dedupe-mode 0`, `-f <regex>`); persisted as `extra_args=`. Run warns if it contains an option the dialog already sets.
-- **The bulk_extractor binary is never executed before it passes the identity gate.** A zero-execution pre-check now runs first — MZ/PE signature, not a DLL, console subsystem — so a GUI executable at the configured path is rejected *without being launched*. Previously the capability probe (`-h`) and the `--version` banner check ran against whatever sat at that path: pointing `be_binary` at `notepad.exe` opened roughly five Notepad windows per dialog open. Verdicts are now cached per path (size + write time), the gate runs before any capability probe, and a rejection logs once per (path, reason) rather than on every re-check.
-- **Carved output filenames no longer blow past `MAX_PATH`.** bulk_extractor names every carved file after the input path exactly as passed on the command line, so an absolute path put ~48 characters of 8.3 gibberish inside each name — twice, for `evtx` — which capped exported names at 26 characters and aborted whole runs with exit 6. Native runs now spawn BE with its **working directory set to the input** and pass a **relative** path (`.`, or the bare file name), collapsing that embedded prefix to two characters. Measured on a 110,806-file run: longest carved path 203 of 259 characters, zero write failures, and no exported name truncated. See "Known issues" for the measurements and the `zip_carved` caveat.
-- **`Browse...` works in WSL mode.** A Linux-style path seeded into `GetOpenFileNameW` fails with `FNERR_INVALIDFILENAME` and shows *no dialog at all*; the picker now opens at `\\wsl.localhost\` instead, and any picker failure is logged with `CommDlgExtendedError()`.
-- **Clearer diagnostics.** Unknown scanner names from the cfg cite the offending line (`unknown scanner 'bogus' ignored (bulk_extractor.cfg line 37)`), and the extra-arguments conflict prompt now names the dialog setting the flag would override rather than just the flag.
-- **Dialog polish.** The "Selected items: N" readout is hidden unless that input source is chosen (it previously read as though that count applied to whichever source was active); the WSL checkbox and status bar repaint before the version probe blocks, so toggling no longer feels dead.
-- **X-Tension-manager compatibility layer removed** (that project is retired); the DLL now exports only the standard `XT_*` entry points, and carries a proper `VERSIONINFO` resource.
+- **Input source** — radio: active EO source image / external file or directory / selected items in directory browser. The active-EO radio auto-disables (with a hint explaining *why*) when the active EO doesn't expose a parseable source path — common for physical-disk EOs which return `model+ID` from `XWF_GetEvObjProp` property 9 instead of a path. The raw property-9 value is logged to the X-Ways messages window every run for diagnosis.
+- **Output directory** — defaults to `<case dir>\bulk_extractor_<timestamp>` (or `%TEMP%\...` if no case is open).
+- **bulk_extractor binary** — auto-filled with the bundled binary path; overridable here, or via `bulk_extractor.cfg` `be_binary=...`.
+- **Threads (-j)** — dropdown listing 1..N where N = system cores; default selected = max(1, N/2) so the analyst keeps headroom for X-Ways and the OS while BE is grinding.
+- **Max recursion (-M)** — defaults to 12 (BE's own default).
+- **Scanners** — one checkbox per scanner **reported by the selected binary** (`bulk_extractor -h`; 37 for BE 2.2.0, 4 columns, alphabetical down each column), pre-checked to that binary's own defaults, tooltips from `-H`. "Reset to defaults" restores them. The X-Tension only emits `-e` / `-x` for scanners that diverge from the binary's defaults, so the cmdline stays readable and a flag is never sent for a scanner the binary doesn't know. Title reads "Scanners (built-in list)" if the probe failed, "Scanners (discovering…)" while a WSL probe runs.
+- **Extra arguments** — appended verbatim after the scanner flags and `-R`, before the input path; for `-S` options, `--dedupe-mode`, `-f`/`-F` find patterns, and future flags. Run warns about `-o/-e/-x/-R/-j/-M` collisions.
+- **Output handling** — four checkboxes:
+  - Add output dir as evidence (default on).
+  - Open in Explorer when done.
+  - Label scanned source items `BE scanned` (selected-items mode only, default on) — every successfully exported item gets the label, so even partial runs leave an audit trail.
+  - Label items with feature hits per scanner — `BE: email`, `BE: net`, `BE: vin`, … (selected-items mode only, default on) — subset of "scanned" where bulk_extractor found ≥1 feature; mapped via the `xwitem_<itemID>_` token in the temp filenames.
 
-## v0.4.0-beta changes (2026-06-06)
+## Inputs
 
-- **Beta designation.** Version string is now `0.4.0-beta` (shown in the About box, the missing-pointer diagnostics, and the cfg header). No functional change from 0.4.0 — the suffix just marks the public-beta milestone as this X-Tension moves into its own repository.
-- **Helper-exe identity verification.** The resolved Windows `bulk_extractor64.exe` is identity-checked before it is spawned — PE `VERSIONINFO` substring (`InternalName` / `OriginalFilename` / `ProductName` / `FileDescription`) **or** `--version` banner, needle `bulk_extractor` (case-insensitive). Applied at every resolution site (dialog field, cfg, bundled, Browse..., and the headless RVS path). A rejected file is refused hard; in dialog mode it surfaces inline as a bold-red, briefly-flashing `Not a valid bulk_extractor.exe file` on the status line (no MessageBox) and disables Run until a valid Browse pick clears it. WSL mode is exempt (the Linux binary can't be inspected from the Windows side).
-- **Ctrl-to-save gesture.** Holding **Ctrl** swaps the Run button to a blue **"Save"** (writes the current dialog state to the `bulk_extractor.cfg` sidecar next to the DLL, skipping Run-only validation) and Close to **"Save as..."** (a `GetSaveFileNameW` export). Backed by a new `SaveCfg` helper. Enter still triggers Run via `DM_SETDEFID`.
-- **Bundled-binary path fix.** The bundled-default resolver now looks for `bulk_extractor64.exe` **alongside the DLL** (`<dll_dir>\bulk_extractor64.exe`), matching `build.bat`'s deploy layout and the project convention. It previously looked in a `bulk_extractor\` subfolder that `build.bat` never created, so the bundled default silently failed and analysts had to fall back to a cfg/dialog override. **Migration:** if you previously placed the binary in a `bulk_extractor\` subfolder, move it next to the DLL (or just re-run `build.bat`).
+Three input modes, picked in the dialog:
 
-## v0.3.0 changes (2026-05-05 — WSL bulk_extractor support)
+1. **Active evidence object's source image** — resolved via `XWF_GetEvObjProp(hEvidence, 9, ...)`. Works for image-backed evidence (`.E01`, `.dd`, etc.); does not work for physical-disk evidence (`XWF_GetEvObjProp` returns the model+ID rather than a path). The dialog disables this radio when no parseable source path is available.
+2. **Pick file or directory** — standard Win32 file/folder pickers.
+3. **Use selected items in directory browser** — invoked via right-click → Run X-Tension. Selected items are exported to a temp dir as `xwitem_<itemID>_<safe_leaf>.bin`, BE runs on the temp dir with `-R`, then we walk feature files looking for the `xwitem_NNN_` token to map hits back to source item IDs.
 
-- **Run via WSL** checkbox in the dialog. Detected once at first dialog open via `wsl --status` → `wsl which bulk_extractor` → `wsl bulk_extractor -V`. Status readout next to the checkbox shows the detected version (`WSL bulk_extractor v2.1.1 detected`) or the "not detected" reason.
-- **BE-binary edit holds a Linux path** when WSL mode is on (e.g. `/usr/bin/bulk_extractor`); toggling the checkbox swaps it with the Windows path. Both paths are kept in `Settings` so the analyst can flip back and forth without losing typing.
-- **Path translation** at run time. `wsl.exe -e <linuxBe> -o /mnt/c/...output ...` — Windows paths are mapped to `/mnt/c/...` for BE; output flows back to the same Windows location, transparent to the rest of the post-processing.
-- **Browse... handles WSL UNCs.** When picking a binary in WSL mode, `\\wsl$\<distro>\usr\bin\bulk_extractor` returned by the picker is automatically converted to `/usr/bin/bulk_extractor` before going into the field.
-- New sidecar config keys: `use_wsl=true` (pre-checks the dialog box, honored only if detection succeeds) and `wsl_be_binary=/path/...` (overrides auto-detected Linux path).
-- **Version-string parser handles BE 2.1.x** (`bulk_extractor 2.1.1`) in addition to BE 2.0.x (`bulk_extractor version 2.0.4`). Falls back to scanning for the first whitespace-delimited token that starts with a digit and contains a `.`.
-- **UI no longer freezes during long BE runs.** The synchronous `WaitForSingleObject(beProcess, INFINITE)` was upgraded to `MsgWaitForMultipleObjects` + `PeekMessage` pump, so X-Ways' main window keeps painting / responding to clicks while BE grinds. Previously a multi-GB run made X-Ways show "(Not Responding)" until BE finished.
+## Outputs
+
+Three checkboxes in the dialog (default = first only):
+
+- **Add output directory to X-Ways case as evidence object** — calls `XWF_CreateEvObj(nType=3, ...)` (Directory). Lets X-Ways index the feature files alongside the rest of the case.
+- **Open output folder in Explorer when done** — `ShellExecuteW`.
+- **Label scanned source items** (selected-items mode only) — every successfully exported item gets the label `BE scanned` at export time. Audit trail of "what did we run BE on, when".
+- **Label items with feature hits** (selected-items mode only) — items whose exported temp file appears in a feature file get one label per scanner that hit (`BE: email`, `BE: net`, …). Subset of "scanned".
+
+## Bundle layout
+
+```text
+xtensions\                                  <- copied into <X-Ways install>\xtensions\
+└── xways-bulk_extractor\
+    ├── xways-bulk_extractor.dll
+    ├── xways-bulk_extractor.cfg            (optional sidecar overrides)
+    ├── xways-bulk_extractor.cfg.example    (documents every cfg key)
+    └── bulk_extractor64.exe                (upstream binary, alongside the DLL — v2.2.0+ recommended)
+```
+
+### Sourcing `bulk_extractor64.exe`
+
+The ~97 MB binary is **not committed to this repo** (`.gitignore`'d to keep the
+clone size sane); fresh checkouts need to download it once. Since **v2.2.0**
+(2026-08-18) upstream publishes an official precompiled Windows binary with
+each GitHub release — verify its SHA-256 against the release's `SHA256SUMS`:
+
+- Upstream project: <https://github.com/simsong/bulk_extractor>
+- Windows binary download: <https://github.com/simsong/bulk_extractor/releases/latest> (`bulk_extractor64.exe` asset)
+- Expected install path: `xtensions/xways-bulk_extractor/bulk_extractor64.exe` (alongside the built DLL).
+
+(Historical: before 2.2.0 the only precompiled Windows binary was a v2.0.2
+build hosted on the Digital Corpora S3 bucket — no longer recommended.)
+
+When a newer Windows build ships, drop it in the same path and the X-Tension
+picks it up automatically (see priority chain below). To pin to an
+out-of-tree binary, use the dialog field or `be_binary=` in
+`bulk_extractor.cfg`.
+
+The DLL resolves the BE binary via this priority chain (highest wins):
+
+1. Path entered in the dialog field.
+2. `be_binary=...` in `bulk_extractor.cfg`.
+3. `<dll_dir>\bulk_extractor64.exe` (the bundled default — alongside the DLL).
+
+A future BE Windows release just drops in: replace the `.exe` (same path) and run again. Or pin to a different location via the cfg or dialog.
+
+### Sidecar cfg keys (optional)
+
+`bulk_extractor.cfg` next to the DLL — `key=value`, one per line, `#` for comments:
+
+```ini
+# Override path to bulk_extractor64.exe
+be_binary=C:\Tools\bulk_extractor\v2.1.x\bulk_extractor64.exe
+
+# Override the default output directory (otherwise uses <case dir>\bulk_extractor_<stamp>)
+default_output_dir=E:\BE_output
+
+# Keep the selected-items export temp dir after a successful BE run.
+# Default behaviour is to auto-delete on BE-success (since the temp dir holds
+# full-byte copies of the selected items — sensitive content + accumulating
+# disk usage). Set this to true if you want to inspect the exported
+# xwitem_*.bin files post-run (e.g. to cross-check BE feature hits against
+# the raw bytes).
+keep_temp_dir=false
+
+# Scanner toggles by NAME, only where they differ from the selected
+# binary's own defaults (written by Ctrl+Run). Unknown names are ignored.
+scanners_enable=base16,wordlist
+scanners_disable=vcard_carved
+
+# Free-form extra bulk_extractor options (spliced before the input path)
+extra_args=-S jpeg_carve_mode=2
+```
+
+## bulk_extractor 2.2.0 compatibility (verified 2026-08-19)
+
+Verified against the official v2.2.0 Windows release binary (SHA256-checked
+against the published `SHA256SUMS`), exercised directly rather than trusting
+the release notes:
+
+- **Scanner set**: all 35 pre-2.2.0 scanners unchanged (defaults included —
+  `base16` still exists, still default-off). Two additions, both default-on:
+  `vin` and `rtti`, so the checklist shows 37. Per `-H`, each new scanner's
+  feature name equals its scanner name (`vin.txt` confirmed live with test
+  VINs), so hit labels come out as `BE: vin` / `BE: rtti`. The checklist is
+  read from the binary at dialog open, so this required no scanner-table edit.
+- **Identity gate / version parse**: the MinGW-built exe ships an empty PE
+  `VERSIONINFO`, so verification passes via the `--version` banner
+  (`bulk_extractor 2.2.0`, same shape as 2.1.x — parser unchanged).
+- **E01 + raw devices, natively on Windows**: a test E01 was decompressed and
+  scanned at full logical size without WSL; the help text documents raw-device
+  inputs (`\\.\PhysicalDriveN`, `\\.\X:`, `\\?\Volume{GUID}`).
+- **Output-dir semantics changed**: instead of refusing a non-empty output
+  dir, 2.2.0's restart logic exits 0 and silently processes nothing when the
+  dir holds a completed run (existing feature files are left intact). Use a
+  fresh dir per run; the new `-Z` (zap) flag wipes the dir first if you truly
+  want to reuse one.
+- **`--dedupe-mode`** is new but defaults to `2` (legacy) — behavior matches
+  2.1.x unless overridden.
+
+## Bundled bulk_extractor version
+
+The recommended `bulk_extractor64.exe` is the official **v2.2.0** release asset from GitHub — the first upstream release with a precompiled Windows binary (CI-built via MinGW cross-compile; statically linked, no DLL dependencies, empty PE `VERSIONINFO` so the identity gate uses its `--version` banner). It reads E01 images and raw devices natively.
+
+- File: `xtensions\xways-bulk_extractor\bulk_extractor64.exe`
+- Source: <https://github.com/simsong/bulk_extractor/releases/tag/v2.2.0>
+- Size: 97,268,659 bytes
+- SHA-256: `DFCC678EE3B7DA111E8FBA6259C4E842FFFFCBE42DD96E6C6E6CC238D74BD911`
+
+(The previous recommendation was the v2.0.2 build from the Digital Corpora S3 bucket, 90,072,666 bytes, SHA-256 `01364D33C0A0AF86DEAD0B56794E5A098BD10280174FD0D67537BAFEB500A4A0` — still works with this X-Tension, but lacks E01/raw-device input and the `vin`/`rtti` scanners.)
+
+To upgrade later: drop a newer `bulk_extractor64.exe` over the bundled one, or point the cfg / dialog at a different path.
+
+## Building
+
+From the **x64 Native Tools Command Prompt for VS 2019/2022**:
+
+```bat
+cd x-tensions\xways-bulk_extractor
+build.bat
+```
+
+`build.bat` runs `rc.exe` on the dialog template, `cl.exe` on the source, links to `xways-bulk_extractor.dll`, and stages a fresh copy under `xtensions\xways-bulk_extractor\` for deployment.
+
+## Deployment
+
+Copy the `xtensions\xways-bulk_extractor\` folder into `<X-Ways install>\xtensions\`. The DLL resolves the bundled BE binary relative to its own directory (`GetModuleFileNameW`), so the `bulk_extractor64.exe` sitting next to it is found automatically.
 
 ## Setting up bulk_extractor in WSL
 
-The X-Tension auto-detects whatever BE the analyst has installed in WSL — nothing is bundled or pre-built.
-
-> **Note:** since BE 2.2.0 ships an official Windows binary with native E01 and raw-device support, WSL mode is optional — useful mainly if you prefer a distro-packaged or self-built BE.
+Optional. Since bulk_extractor 2.2.0 ships an official Windows binary with native E01 and raw-device support, WSL is only useful if you prefer a distro-packaged or self-built BE. The X-Tension auto-detects whatever BE the analyst has installed in WSL — nothing is bundled or pre-built.
 
 `bulk-extractor` is **not in current Ubuntu repos** (it was removed in 22.04+ and Debian 11+), so `apt install` won't work on a fresh WSL install. The reliable path is **build from source**. Recipe distilled from [upstream's install wiki](https://github.com/simsong/bulk_extractor/wiki/Installing-bulk_extractor):
 
@@ -117,180 +231,6 @@ If a previous build attempt left a partial clone, `rm -rf ~/bulk_extractor` and 
 ### WSL distro choice
 
 The X-Tension uses `wsl.exe -e ...` which targets the analyst's **default** distro (set with `wsl --set-default <name>`). No distro-specific code in the X-Tension. Setup docs target Ubuntu since that's the default for fresh WSL installs.
-
-### BE 2.2.0 compatibility (verified 2026-08-19)
-
-Verified against the official v2.2.0 Windows release binary (SHA256-checked
-against the published `SHA256SUMS`), exercised directly rather than trusting
-the release notes:
-
-- **Scanner set**: all 35 pre-2.2.0 scanners unchanged (defaults included —
-  `base16` still exists, still default-off). Two additions, both default-on:
-  `vin` and `rtti`. `kScanners` and `FeatureToScanner` updated; per `-H`, each
-  new scanner's feature name equals its scanner name (`vin.txt` confirmed live
-  with test VINs), so hit labels come out as `bulk_extractor: vin` / `rtti`.
-- **Identity gate / version parse**: the MinGW-built exe ships an empty PE
-  `VERSIONINFO`, so verification passes via the `--version` banner
-  (`bulk_extractor 2.2.0`, same shape as 2.1.x — parser unchanged).
-- **E01 + raw devices, natively on Windows**: a test E01 was decompressed and
-  scanned at full logical size without WSL; the help text documents raw-device
-  inputs (`\\.\PhysicalDriveN`, `\\.\X:`, `\\?\Volume{GUID}`).
-- **Output-dir semantics changed**: instead of refusing a non-empty output
-  dir, 2.2.0's restart logic exits 0 and silently processes nothing when the
-  dir holds a completed run (existing feature files are left intact). Use a
-  fresh dir per run; the new `-Z` (zap) flag wipes the dir first if you truly
-  want to reuse one.
-- **`--dedupe-mode`** is new but defaults to `2` (legacy) — behavior matches
-  2.1.x unless overridden.
-
-### BE 2.1.x compatibility (verified 2026-05-05)
-
-The Windows side ships BE 2.0.2 (bundled binary) and the WSL side runs whatever the analyst built — verified working against **BE 2.1.1** built from `master` on Ubuntu 24.04. End-to-end run (8 NTFS items including bootmgr, MFT, pagefile.sys) returned exit code 0, produced feature files, and surfaced 10 per-scanner labels across 18 tagged items.
-
-- **Cmdline flags** — `-o`, `-j`, `-M`, `-R`, `-e`, `-x` all behave the same as 2.0.x. No changes needed.
-- **New `*_carved` feature files in 2.1.x** — `ntfslogfile_carved`, `ntfsmft_carved`, `ntfsusn_carved`, `winpe_carved` appear alongside the parent recorders. These surface as `bulk_extractor: ntfslogfile_carved` etc. via the per-scanner-label code, which derives labels from feature filenames — no `FeatureToScanner` table change required.
-- **Scanner toggle list** — discovered from the selected binary since v0.5.0 (`-h`), so a 2.1.1 binary shows its 36 scanners and a 2.2.0 binary its 37; the built-in table is only a fallback. *(Historical: the table was built against 2.0.2's 35 scanners and verified unchanged through 2.1.1.)*
-
-Feature files the label mapper doesn't know surface as labels under their own name (`FeatureToScanner` falls through), so nothing needs maintaining when BE adds feature outputs.
-
-## v0.2.4 changes (2026-05-03 — followups from first end-to-end run)
-
-- **Auto-cleanup of selected-items temp dir.** Previously `<dll_dir>\temp\` accumulated one `be_input_<stamp>_*` per run, each holding full-byte copies of the selected items (sensitive content sitting outside the case + indefinite disk growth). v0.2.4 deletes the temp dir recursively when BE returned exit code 0; keeps it on BE-failure so the analyst can inspect what was sent. Override with `keep_temp_dir=true` in `bulk_extractor.cfg` if you want to preserve every export for cross-checking against feature-file hits.
-- **Virtual / unreadable items distinguished from real export failures.** Items like `Free space` (synthetic / computed) report `XWF_GetItemSize > 0` but `XWF_Read` returns 0 bytes immediately. v0.2.3 logged these as `export FAILED:` (misleading) and counted them in the failure tally. v0.2.4 detects "first-chunk zero-read" and logs `skipped (virtual / unreadable)` instead, doesn't tag them as scanned, and surfaces a separate "(N virtual / unreadable items skipped)" line in the run summary.
-
-## v0.2.3 changes (2026-05-03 — folded findings from xways_recon_probe)
-
-- **`hVolume = NULL` guard.** Per 21.4 SR-5, X-Ways passes a `NULL` volume handle when the X-Tension is invoked from the **Case Root** window. Previously the selected-items export would AV. v0.2.3 detects this and shows the analyst a friendly "use the partition / image directory browser instead" dialog.
-- **Temp dir moved to `<dll_dir>\temp\`.** Previously used `XWF_GetEvObjProp(.., 12, ..)` (the X-Ways evidence working directory) — but X-Ways periodically tries to delete unrecognised files there, causing modal "Cannot delete" warnings during selected-items export. New base avoids the conflict.
-- **`XT_Finalize` returns `0x02`** after the run mutated snapshot state (added Labels, attached output evidence object). Per 21.3 Preview 3, X-Ways persists those changes automatically — saves the analyst a manual save step.
-- **`XWF_AddToReportTable` flags = `0x01`** (`AddReportTableFlags::CreatedByApplication`, per the xwf-api-rs community bindings). Marks the auto-tagged Labels as application-created vs examiner-created — visually distinct in the Labels picker.
-- **Per-item progress to the Output window** (`XWF_OutputMessage` flag `0x08`, v20.6+). Keeps the Messages window clean; only run start, errors, and summary tallies stay there. Older X-Ways builds ignore the flag harmlessly.
-
-## What's in the dialog (v0.2.0)
-
-- **Input source** — radio: active EO source image / external file or directory / selected items in directory browser. The active-EO radio auto-disables (with a hint explaining *why*) when the active EO doesn't expose a parseable source path — common for physical-disk EOs which return `model+ID` from `XWF_GetEvObjProp` property 9 instead of a path. The raw property-9 value is logged to the X-Ways messages window every run for diagnosis.
-- **Output directory** — defaults to `<case dir>\bulk_extractor_<timestamp>` (or `%TEMP%\...` if no case is open).
-- **bulk_extractor binary** — auto-filled with the bundled binary path; overridable here, or via `bulk_extractor.cfg` `be_binary=...`.
-- **Threads (-j)** — dropdown listing 1..N where N = system cores; default selected = max(1, N/2) so the analyst keeps headroom for X-Ways and the OS while BE is grinding.
-- **Max recursion (-M)** — defaults to 12 (BE's own default).
-- **Scanners** — one checkbox per scanner **reported by the selected binary** (`bulk_extractor -h`; 37 for BE 2.2.0, 4 columns, alphabetical down each column), pre-checked to that binary's own defaults, tooltips from `-H`. "Reset to defaults" restores them. The X-Tension only emits `-e` / `-x` for scanners that diverge from the binary's defaults, so the cmdline stays readable and a flag is never sent for a scanner the binary doesn't know. Title reads "Scanners (built-in list)" if the probe failed, "Scanners (discovering…)" while a WSL probe runs.
-- **Extra arguments** — appended verbatim after the scanner flags and `-R`, before the input path; for `-S` options, `--dedupe-mode`, `-f`/`-F` find patterns, and future flags. Run warns about `-o/-e/-x/-R/-j/-M` collisions.
-- **Output handling** — four checkboxes:
-  - Add output dir as evidence (default on).
-  - Open in Explorer when done.
-  - Label scanned source items `BE scanned` (selected-items mode only, default on) — every successfully exported item gets the label, so even partial runs leave an audit trail.
-  - Label items with feature hits per scanner — `BE: email`, `BE: net`, `BE: vin`, … (selected-items mode only, default on) — subset of "scanned" where bulk_extractor found ≥1 feature; mapped via the `xwitem_<itemID>_` token in the temp filenames. *(v0.5.0: label names shortened from `bulk_extractor …` to `BE …`; the per-scanner labels replaced the old umbrella `bulk_extractor hits` label.)*
-
-## Inputs
-
-Three input modes, picked in the dialog:
-
-1. **Active evidence object's source image** — resolved via `XWF_GetEvObjProp(hEvidence, 9, ...)`. Works for image-backed evidence (`.E01`, `.dd`, etc.); does not work for physical-disk evidence (`XWF_GetEvObjProp` returns the model+ID rather than a path). The dialog disables this radio when no parseable source path is available.
-2. **Pick file or directory** — standard Win32 file/folder pickers.
-3. **Use selected items in directory browser** — invoked via right-click → Run X-Tension. Selected items are exported to a temp dir as `xwitem_<itemID>_<safe_leaf>.bin`, BE runs on the temp dir with `-R`, then we walk feature files looking for the `xwitem_NNN_` token to map hits back to source item IDs.
-
-## Outputs
-
-Three checkboxes in the dialog (default = first only):
-
-- **Add output directory to X-Ways case as evidence object** — calls `XWF_CreateEvObj(nType=3, ...)` (Directory). Lets X-Ways index the feature files alongside the rest of the case.
-- **Open output folder in Explorer when done** — `ShellExecuteW`.
-- **Label scanned source items** (selected-items mode only) — every successfully exported item gets the label `BE scanned` at export time. Audit trail of "what did we run BE on, when".
-- **Label items with feature hits** (selected-items mode only) — items whose exported temp file appears in a feature file get one label per scanner that hit (`BE: email`, `BE: net`, …). Subset of "scanned".
-
-## Bundle layout
-
-```text
-xtensions\                                  <- copied into <X-Ways install>\xtensions\
-└── xways-bulk_extractor\
-    ├── xways-bulk_extractor.dll
-    ├── xways-bulk_extractor.cfg            (optional sidecar overrides)
-    ├── xways-bulk_extractor.cfg.example    (documents every cfg key)
-    └── bulk_extractor64.exe                (upstream binary, alongside the DLL — v2.2.0+ recommended)
-```
-
-### Sourcing `bulk_extractor64.exe`
-
-The ~97 MB binary is **not committed to this repo** (`.gitignore`'d to keep the
-clone size sane); fresh checkouts need to download it once. Since **v2.2.0**
-(2026-08-18) upstream publishes an official precompiled Windows binary with
-each GitHub release — verify its SHA-256 against the release's `SHA256SUMS`:
-
-- Upstream project: <https://github.com/simsong/bulk_extractor>
-- Windows binary download: <https://github.com/simsong/bulk_extractor/releases/latest> (`bulk_extractor64.exe` asset)
-- Expected install path: `xtensions/xways-bulk_extractor/bulk_extractor64.exe` (alongside the built DLL).
-
-(Historical: before 2.2.0 the only precompiled Windows binary was a v2.0.2
-build hosted on the Digital Corpora S3 bucket — no longer recommended.)
-
-When a newer Windows build ships, drop it in the same path and the X-Tension
-picks it up automatically (see priority chain below). To pin to an
-out-of-tree binary, use the dialog field or `be_binary=` in
-`bulk_extractor.cfg`.
-
-The DLL resolves the BE binary via this priority chain (highest wins):
-
-1. Path entered in the dialog field.
-2. `be_binary=...` in `bulk_extractor.cfg`.
-3. `<dll_dir>\bulk_extractor64.exe` (the bundled default — alongside the DLL).
-
-A future BE Windows release just drops in: replace the `.exe` (same path) and run again. Or pin to a different location via the cfg or dialog.
-
-### Sidecar cfg keys (optional)
-
-`bulk_extractor.cfg` next to the DLL — `key=value`, one per line, `#` for comments:
-
-```ini
-# Override path to bulk_extractor64.exe
-be_binary=C:\Tools\bulk_extractor\v2.1.x\bulk_extractor64.exe
-
-# Override the default output directory (otherwise uses <case dir>\bulk_extractor_<stamp>)
-default_output_dir=E:\BE_output
-
-# v0.2.4: keep the selected-items export temp dir after a successful BE run.
-# Default behaviour is to auto-delete on BE-success (since the temp dir holds
-# full-byte copies of the selected items — sensitive content + accumulating
-# disk usage). Set this to true if you want to inspect the exported
-# xwitem_*.bin files post-run (e.g. to cross-check BE feature hits against
-# the raw bytes).
-keep_temp_dir=false
-
-# v0.5.0: scanner toggles by NAME, only where they differ from the selected
-# binary's own defaults (written by Ctrl+Run). Unknown names are ignored.
-scanners_enable=base16,wordlist
-scanners_disable=vcard_carved
-
-# v0.5.0: free-form extra bulk_extractor options (spliced before the input path)
-extra_args=-S jpeg_carve_mode=2
-```
-
-## Bundled bulk_extractor version
-
-The recommended `bulk_extractor64.exe` is the official **v2.2.0** release asset from GitHub — the first upstream release with a precompiled Windows binary (CI-built via MinGW cross-compile; statically linked, no DLL dependencies, empty PE `VERSIONINFO` so the identity gate uses its `--version` banner). It reads E01 images and raw devices natively.
-
-- File: `xtensions\xways-bulk_extractor\bulk_extractor64.exe`
-- Source: <https://github.com/simsong/bulk_extractor/releases/tag/v2.2.0>
-- Size: 97,268,659 bytes
-- SHA-256: `DFCC678EE3B7DA111E8FBA6259C4E842FFFFCBE42DD96E6C6E6CC238D74BD911`
-
-(The previous recommendation was the v2.0.2 build from the Digital Corpora S3 bucket, 90,072,666 bytes, SHA-256 `01364D33C0A0AF86DEAD0B56794E5A098BD10280174FD0D67537BAFEB500A4A0` — still works with this X-Tension, but lacks E01/raw-device input and the `vin`/`rtti` scanners.)
-
-To upgrade later: drop a newer `bulk_extractor64.exe` over the bundled one, or point the cfg / dialog at a different path.
-
-## Building
-
-From the **x64 Native Tools Command Prompt for VS 2019/2022**:
-
-```bat
-cd x-tensions\xways-bulk_extractor
-build.bat
-```
-
-`build.bat` runs `rc.exe` on the dialog template, `cl.exe` on the source, links to `xways-bulk_extractor.dll`, and stages a fresh copy under `xtensions\xways-bulk_extractor\` for deployment.
-
-## Deployment
-
-Copy the `xtensions\xways-bulk_extractor\` folder into `<X-Ways install>\xtensions\`. The DLL resolves the bundled BE binary relative to its own directory (`GetModuleFileNameW`), so the `bulk_extractor64.exe` sitting next to it is found automatically.
 
 ## Why we extract instead of using `XWF_Mount`
 
