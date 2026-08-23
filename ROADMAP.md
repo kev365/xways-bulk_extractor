@@ -8,7 +8,7 @@ nice-to-have, P3 = only if upstream/usage forces it.
 
 ## Planned
 
-### P1 — bulk_extractor 2.2.0 integration
+### ~~P1 — bulk_extractor 2.2.0 integration~~ — delivered in v0.5.0
 
 Upstream released **v2.2.0 on 2026-08-18** — the first release with an
 **official precompiled Windows binary** (`bulk_extractor64.exe`, built by CI
@@ -32,9 +32,10 @@ not just the release notes — which turned out to be misleading in two places.
   option defaults to `2 (legacy)` — same behavior as 2.1.x, now tunable.
 - E01 input works natively: a test E01 was decompressed and scanned at its
   full logical size (no WSL involved).
-- All 35 scanners in `kScanners` still exist with unchanged defaults.
+- All 35 scanners in the then-hard-coded table still exist with unchanged
+  defaults. *(Moot since v0.5.0 — the checklist is discovered from the binary.)*
 
-**To do:**
+**Delivered:**
 
 - [x] Append the two **new scanners** to `kScanners`, both enabled by
   default upstream: `vin` (Vehicle Identification Numbers, Kam A. Woods) and
@@ -58,18 +59,31 @@ not just the release notes — which turned out to be misleading in two places.
   for E01 or for running ≥2.1; the "BE 2.0.2 is the only precompiled
   Windows build" claim is obsolete), bundled-binary guidance, version
   examples. *(Done 2026-08-19.)*
-- [ ] Consider exposing `--dedupe-mode` and `-Z` in the dialog/cfg
-  (default-off; `-Z` needs a confirm — it recursively deletes).
-- [ ] Manual (X-Ways GUI) verification: identity gate should report
-  "--version banner match" for the staged 2.2.0 exe; per-scanner label for a
-  `vin` hit; a full selected-items run end-to-end.
+- [x] Manual (X-Ways GUI) verification. *(Done 2026-08-23 on X-Ways 21.8
+  SR-5: identity gate logs "--version banner match" for the 2.2.0 exe; a
+  `vin` hit produced its own `BE: vin` label; a 110,806-item selected-items
+  run completed with exit 0, 19 per-scanner labels and zero write failures;
+  the WSL 2.2.0 binary was exercised end-to-end as well.)*
 
-### P2 — In-DLL progress (remove BE's console window)
+Carried forward (now P2, below): exposing `--dedupe-mode` and `-Z`.
 
-v0.5.0 added the worker thread + real **Cancel** (see Shipped). What
-remains of the original goal: capture BE's stdout/stderr instead of running
-with `CREATE_NEW_CONSOLE`, and surface progress in the dialog (status line /
-progress bar) so the extra console window disappears.
+### P2 — Capture BE's output (remove its console window)
+
+v0.5.0 delivered most of this: the worker thread, real **Cancel**, and an
+in-dialog status/progress bar that already reports the export phase item by
+item. What remains is the console window itself — BE is still spawned with
+`CREATE_NEW_CONSOLE` so the analyst can watch it. Capturing its stdout/stderr
+instead and driving the existing status bar from that would remove the extra
+window, at the cost of the live scrollback (and of the "console closed"
+failure mode, `0xC000013A`, which currently surfaces as an exit-code hint).
+
+### P2 — Expose `--dedupe-mode` and `-Z`
+
+Carried over from the 2.2.0 integration. Both are reachable today through the
+**Extra arguments** field, so this is only about promoting them to real
+controls: `--dedupe-mode` as a dropdown, `-Z` (zap) behind a confirmation —
+it recursively deletes the output directory, which is why it is deliberately
+absent from the extra-arguments cue-banner hint.
 
 ### P2 — Physical-disk EO source-path support
 
@@ -101,8 +115,7 @@ live): Run now re-stamps a previously-used *auto-suggested* dir so every Run
 gets a fresh timestamped dir. What remains of this item is the analyst-typed
 custom path: detect a non-empty dir there before launch and prompt to pick a
 new one (or clear it, e.g. via BE 2.2.0's `-Z`). The stakes changed with BE
-2.2.0:
-older BE refused a non-empty dir with a loud console error, but 2.2.0's
+2.2.0: older BE refused a non-empty dir with a loud console error, but 2.2.0's
 restart logic **silently no-ops** when pointed at a completed run's dir
 (exit 0, nothing processed) — an analyst reusing a dir gets stale results
 with no warning. The suggested-fresh-subdir default already avoids this;
@@ -118,16 +131,38 @@ cover future options without an X-Tension change. Remaining maintenance:
 `FeatureToScanner` (label naming) when BE adds feature files whose names
 don't match their scanner — unknown names already fall through unharmed.
 
+### P3 — Report the carved-filename bug upstream
+
+`feature_recorder.cpp` splits the input path with `rfind('/')`, which never
+matches a Windows backslash, so on Windows the *entire* input path ends up
+inside every carved filename (twice, for `evtx`). v0.5.0 works around it by
+passing a relative path, but a one-line upstream fix (`find_last_of("/\\")`)
+would remove the need for the workaround — and for the export name cap — for
+every Windows user of bulk_extractor, not just this X-Tension. Not yet
+reported; worth a minimal reproducer against 2.2.0.
+
 ## Shipped
 
 Recent milestones (full detail in the README changelog):
 
-- **v0.5.0** (2026-08-23) — real in-DLL **Cancel**: the BE run moved
-  to a joinable worker thread with a three-phase split that keeps every
-  `XWF_*` call on X-Ways' own thread (A: input prep in IDOK → B: subprocess
-  on the worker, cancellable via `TerminateProcess` → C: post-processing in
-  `WM_APP_DONE`); X-Tension-manager compatibility layer removed; VERSIONINFO
-  resource added.
+- **v0.5.0** (2026-08-23) — first stable release.
+  - Real in-DLL **Cancel**: the BE run moved to a joinable worker thread with
+    a three-phase split that keeps every `XWF_*` call on X-Ways' own thread
+    (A: input prep in IDOK → B: subprocess on the worker, cancellable via
+    `TerminateProcess` → C: post-processing in `WM_APP_DONE`). The
+    selected-items export pumps messages and is cancellable too.
+  - **bulk_extractor 2.2.0** support, verified against the release artifact.
+  - **Scanner list discovered from the binary** (`-h` / `-H`), with a
+    built-in fallback; toggles persisted by name as a diff from the binary's
+    own defaults; free-form **Extra arguments** field.
+  - **Security fix**: the helper binary is identity-gated *before* it is ever
+    executed (zero-execution PE/subsystem pre-check), verdicts cached per path.
+  - **Correctness fix**: carved output no longer exceeds `MAX_PATH` — BE is
+    given a relative input path and a working directory, which is what made
+    large directory scans survivable (they previously aborted with exit 6).
+  - Dialog rebuilt: binary group on top, scan-target summary, owner-draw
+    status bar, tooltips, About and Open-output buttons, themed hover.
+  - X-Tension-manager compatibility layer removed; VERSIONINFO added.
 - **v0.4.0-beta** — helper-exe identity verification (PE VERSIONINFO + `--version`
   banner, in-dialog flash on rejection); Ctrl-to-save gesture (`SaveCfg`); fixed
   the bundled-binary resolver to look alongside the DLL (was a non-existent
