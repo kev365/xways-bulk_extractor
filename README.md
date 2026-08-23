@@ -2,7 +2,7 @@
 
 Wraps Simson Garfinkel's [bulk_extractor](https://github.com/simsong/bulk_extractor) as an X-Ways Forensics X-Tension. Exposes a settings dialog (parented to X-Ways' main window), runs `bulk_extractor64.exe` (Windows) **or `bulk_extractor` via WSL** against the chosen input, and (optionally) feeds the output back into X-Ways.
 
-> **Status: 0.5.0 — first stable release.** Exercised end-to-end on real cases, including a 110,000-item selected-items run and both native and WSL bulk_extractor 2.2.0 binaries. See [ROADMAP.md](ROADMAP.md) for what is planned next.
+> **Status: 0.5.0 — first stable release.** Exercised end-to-end on real cases, including a 110,000-item selected-items run and both native and WSL bulk_extractor 2.2.0 binaries. Known gaps are listed under [Current limitations](#current-limitations).
 
 ## v0.5.0 changes (2026-08-23 — in-DLL Cancel, BE 2.2.0, dynamic scanners)
 
@@ -353,12 +353,10 @@ not yet reported upstream.
 
 ## Current limitations
 
-See [ROADMAP.md](ROADMAP.md) for the planned work behind these.
-
-- **No in-DLL Cancel button.** BE runs in a new console window (`CREATE_NEW_CONSOLE`) so the analyst sees BE's own progress prints; to cancel, close the console window or kill the process. (Since v0.3.0 the X-Ways main window no longer freezes during a run — the wait loop pumps messages — but there is still no in-DLL Cancel.)
-- **Source-path mode only works for image-backed EOs.** Physical-disk EOs return a model+ID string from `XWF_GetEvObjProp` property 9, not a path. The radio is disabled in that case; use "Pick file or directory" with the device path manually.
-- **Tag-source-items is selected-items-mode only.** Other modes have no usable mapping from BE's offset paths back to X-Ways item IDs.
-- **No pre-flight check that the output dir is empty.** BE will refuse to run if the dir already contains a BE run; analyst sees the error in the BE console and re-runs with a different dir.
+- **bulk_extractor still runs in its own console window.** BE is spawned with `CREATE_NEW_CONSOLE` so the analyst can watch its progress prints. Cancel works from the dialog (v0.5.0 terminates the child within ~100 ms), but BE's output is not yet captured into the dialog itself. Closing that console window out from under a run kills BE — the exit code is reported as `0xC000013A` with a hint saying so.
+- **Source-path mode only works for image-backed EOs.** Physical-disk EOs return a model+ID string from `XWF_GetEvObjProp` property 9, not a path. The radio is disabled in that case; use "External file or directory" with the device path entered manually.
+- **Labelling is selected-items-mode only.** Other modes have no usable mapping from BE's offset-based forensic paths back to X-Ways item IDs.
+- **No pre-flight check that a manually-typed output dir is empty.** The auto-suggested directory is re-stamped on every Run, so the default path is always fresh. A custom path is not checked — and note BE 2.2.0 does not refuse a reused directory the way older versions did: its restart logic sees the finished `report.xml` and exits 0 having silently processed nothing.
 
 ## References
 

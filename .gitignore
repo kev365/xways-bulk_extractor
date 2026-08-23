@@ -65,3 +65,11 @@ desktop.ini
 # -----------------------------------------------------------------------------
 CLAUDE.md
 .claude/
+
+# -----------------------------------------------------------------------------
+#  Planning notes kept local, not published. The README carries the
+#  user-facing "Current limitations"; the roadmap behind them is working
+#  material (priorities, half-finished investigations, upstream gripes) and
+#  is not part of what ships.
+# -----------------------------------------------------------------------------
+ROADMAP.md
