@@ -17,7 +17,7 @@ selected items) and three output integrations (add output dir to the case via
 `XWF_CreateEvObj`, open in Explorer, feature-file hit tagging via `XWF_Label`).
 
 - **Stem / DLL:** `xways-bulk_extractor` → `xways-bulk_extractor.dll`
-- **Version:** `0.5.0-beta` — keep `VERSION` in the `.cpp`, the `.rc`
+- **Version:** `0.5.0` — keep `VERSION` in the `.cpp`, the `.rc`
   VERSIONINFO, and the README in lockstep (versioning convention).
 - **Identity constants** (top of `xways-bulk_extractor.cpp`): `NAME`,
   `VERSION`, `DESCRIPTION`, `REPORT_TABLE_SCANNED`, `REPORT_TABLE_PREFIX`.
@@ -100,8 +100,11 @@ from that thread. `RebuildScannerGrid` is the only thing allowed to replace
   runs BE with its working directory set to the input and passes a relative
   input path (`.`), which collapses the path prefix BE embeds in every carved
   name; the 8.3 short output path and the export name cap remain as backstops
-  (README "Known
-  issues").
+  (README "Known issues").
+- The helper binary is never executed before it passes the identity gate:
+  `IsConsolePeImage` (MZ/PE, not a DLL, console subsystem) runs first, so a
+  GUI exe at the configured path is rejected without ever being launched.
+  Verdicts are cached per path; rejections log once per (path, reason).
 - `XT_Finalize` returns `0x02` ("save volume snapshot") when the run added
   labels or an evidence object.
 

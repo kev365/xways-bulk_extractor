@@ -73,7 +73,7 @@
 
 // --- Identity ---------------------------------------------------------------
 static const wchar_t* NAME         = L"bulk_extractor";
-static const wchar_t* VERSION      = L"0.5.0-beta";
+static const wchar_t* VERSION      = L"0.5.0";
 static const wchar_t* DESCRIPTION  = L"Run bulk_extractor on an image, path, or selected items; ingest results.";
 static const wchar_t* REPORT_TABLE_SCANNED = L"BE scanned";   // v0.5.0: short "BE" label names
 static const wchar_t* REPORT_TABLE_PREFIX  = L"BE: ";         // per-scanner: "BE: email", "BE: net", ...

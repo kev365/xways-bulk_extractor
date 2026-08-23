@@ -152,12 +152,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Kevin Stokes"
             VALUE "FileDescription",  "bulk_extractor wrapper for X-Ways Forensics"
-            VALUE "FileVersion",      "0.5.0-beta"
+            VALUE "FileVersion",      "0.5.0"
             VALUE "InternalName",     "xways-bulk_extractor"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Kevin Stokes. MIT License."
             VALUE "OriginalFilename", "xways-bulk_extractor.dll"
             VALUE "ProductName",      "xways-bulk_extractor"
-            VALUE "ProductVersion",   "0.5.0-beta"
+            VALUE "ProductVersion",   "0.5.0"
         END
     END
     BLOCK "VarFileInfo"

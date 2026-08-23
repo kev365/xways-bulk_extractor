@@ -1,8 +1,7 @@
 # Roadmap — xways-bulk_extractor
 
-Current version: **0.5.0-beta** (in development on `feature/in-dll-cancel`).
-Functionally complete and exercised end-to-end on real cases; the items below
-are what's planned before a stable **1.0**.
+Current version: **0.5.0** — the first stable release. The items below are
+what is planned toward **1.0**.
 
 Priorities are a guide, not a contract. Roughly: P1 = wanted for 1.0, P2 =
 nice-to-have, P3 = only if upstream/usage forces it.
@@ -67,7 +66,7 @@ not just the release notes — which turned out to be misleading in two places.
 
 ### P2 — In-DLL progress (remove BE's console window)
 
-v0.5.0-beta added the worker thread + real **Cancel** (see Shipped). What
+v0.5.0 added the worker thread + real **Cancel** (see Shipped). What
 remains of the original goal: capture BE's stdout/stderr instead of running
 with `CREATE_NEW_CONSOLE`, and surface progress in the dialog (status line /
 progress bar) so the extra console window disappears.
@@ -97,7 +96,7 @@ BE's forensic-path output can be resolved back to snapshot items (e.g. via
 
 ### P2 — Pre-flight empty-output-dir check
 
-**Partially addressed in v0.5.0-beta** (2026-08-19, after observing the trap
+**Partially addressed in v0.5.0** (2026-08-19, after observing the trap
 live): Run now re-stamps a previously-used *auto-suggested* dir so every Run
 gets a fresh timestamped dir. What remains of this item is the analyst-typed
 custom path: detect a non-empty dir there before launch and prompt to pick a
@@ -123,7 +122,7 @@ don't match their scanner — unknown names already fall through unharmed.
 
 Recent milestones (full detail in the README changelog):
 
-- **v0.5.0-beta** (in development) — real in-DLL **Cancel**: the BE run moved
+- **v0.5.0** (2026-08-23) — real in-DLL **Cancel**: the BE run moved
   to a joinable worker thread with a three-phase split that keeps every
   `XWF_*` call on X-Ways' own thread (A: input prep in IDOK → B: subprocess
   on the worker, cancellable via `TerminateProcess` → C: post-processing in
