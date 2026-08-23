@@ -1622,6 +1622,14 @@ static void UpdateInputState(HWND hDlg, const Settings* s) {
     bool isSelected = IsDlgButtonChecked(hDlg, IDC_RADIO_INPUT_SELECTED) == BST_CHECKED;
     EnableWindow(GetDlgItem(hDlg, IDC_CHK_TAG_SCANNED), isSelected);
     EnableWindow(GetDlgItem(hDlg, IDC_CHK_TAG_HITS),    isSelected);
+    // v0.5.0: the "Selected items: N" readout belongs to the selected-items
+    // radio -- leaving it up while another source is chosen reads as if that
+    // count were what the run will process (the Scan target line below is the
+    // authority for that).
+    {
+        HWND hCount = GetDlgItem(hDlg, IDC_STATIC_SELECTED_COUNT);
+        if (hCount) ShowWindow(hCount, (isSelected && s && s->selectedCount > 0) ? SW_SHOW : SW_HIDE);
+    }
     if (!isSelected) {
         CheckDlgButton(hDlg, IDC_CHK_TAG_SCANNED, BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_CHK_TAG_HITS,    BST_UNCHECKED);
