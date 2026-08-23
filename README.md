@@ -158,7 +158,7 @@ Copy the `xtensions\xways-bulk_extractor\` folder into `<X-Ways install>\xtensio
 
 ## Setting up bulk_extractor in WSL
 
-Optional. Since bulk_extractor 2.2.0 ships an official Windows binary with native E01 and raw-device support, WSL is only useful if you prefer a distro-packaged or self-built BE. The X-Tension auto-detects whatever BE the analyst has installed in WSL — nothing is bundled or pre-built.
+Optional, and **not the recommended path**. bulk_extractor 2.2.0 ships an official Windows binary with native E01 and raw-device support — use that (it is what the X-Tension bundles and resolves by default). WSL support predates the Windows binary and is kept because it already exists and works; it only makes sense if you prefer a distro-packaged or self-built BE. The X-Tension auto-detects whatever BE the analyst has installed in WSL — nothing is bundled or pre-built for it.
 
 `bulk-extractor` is **not in current Ubuntu repos** (it was removed in 22.04+ and Debian 11+), so `apt install` won't work on a fresh WSL install. The reliable path is **build from source**. Recipe distilled from [upstream's install wiki](https://github.com/simsong/bulk_extractor/wiki/Installing-bulk_extractor):
 
