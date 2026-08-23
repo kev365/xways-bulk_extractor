@@ -311,14 +311,30 @@ past `MAX_PATH`, the open fails, and BE aborts with exit 6 and the misleading
 5,446-file selected-items export with BE 2.2.0 (`alerts.txt` in the output dir
 records the exact `cannot open file for writing: ...` path).
 
-Mitigation: in native mode the X-Tension passes the output dir and input path
-to BE as **8.3 short paths** (`C:\xwfb\XWB21-~2\...`), and caps exported
-temp-file leaf names at 40 characters. The case-facing paths (evidence object,
-labels, Open output) stay long. If 8.3 name generation is disabled on the
-volume (`NtfsDisable8dot3NameCreation`), the Messages window says so and very
-long paths may still fail — shorten the case/install paths, or scan fewer
-deeply-named items. A one-line upstream fix (`find_last_of("/\\")`) would
-remove the need for this; not yet reported upstream.
+Mitigation: in native mode the X-Tension spawns bulk_extractor with its
+**working directory set to the input** and passes a **relative** input path
+(`.` for a directory, the bare file name otherwise). Because BE embeds the
+input path exactly as given, the prefix inside every carved filename collapses
+from the full path to two characters. Measured on BE 2.2.0, same corpus and
+scanners:
+
+| input passed to BE | longest carved name |
+| --- | --- |
+| `-R C:\tmp\nametest\in` | `C__tmp_nametest_in_xwitem_0__MFT.bin____-24576.mft` (50) |
+| working dir + `-R .` | `._xwitem_0__MFT.bin____-24576.mft` (33) |
+
+Exit code, feature-file contents and the `xwitem_<id>` mapping token are
+unchanged, and BE writes nothing into the working directory. The one cost is
+that BE's own `report.xml` records `<image_filename>` as the relative path, so
+the X-Tension logs the absolute input next to the command line.
+
+Belt and braces: the output directory is still passed in 8.3 short form, and
+exported temp-file leaf names are still capped — but the cap is now computed
+against the *relative* input, so it lands around 70 characters instead of 26
+and effectively never truncates a real filename. The case-facing paths
+(evidence object, labels, Open output) stay long throughout. A one-line
+upstream fix (`find_last_of("/\\")`) would remove the need for any of this;
+not yet reported upstream.
 
 ## Current limitations
 

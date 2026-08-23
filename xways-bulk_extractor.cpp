@@ -3760,6 +3760,41 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
     // labels, Open output) always keeps the long path.
     const bool isDir = DirExists(inputPath);
     const bool shortPaths = !wsl && isDir;
+
+    // v0.5.0: NATIVE runs spawn bulk_extractor with its working directory set
+    // to the input (the directory itself, or the file's parent) and pass a
+    // RELATIVE input path. bulk_extractor names every carved file after the
+    // input path exactly as given on the command line -- upstream splits that
+    // path with rfind('/'), which never matches a Windows backslash, so the
+    // whole path ends up inside each carved filename (twice, for evtx). A
+    // relative input collapses that embedded prefix to "." / the bare file
+    // name, which is what actually keeps carved paths under MAX_PATH; the 8.3
+    // short form below is now only a second line of defence for a very long
+    // OUTPUT directory.
+    //
+    // Measured 2026-08-22 on BE 2.2.0 (same corpus, same scanners):
+    //   -R C:\tmp\nametest\in  ->  C__tmp_nametest_in_xwitem_0__MFT.bin____-24576.mft  (50)
+    //   cwd + -R .              ->  ._xwitem_0__MFT.bin____-24576.mft                   (33)
+    // Exit code, feature output and the xwitem_<id> mapping token are
+    // unchanged, and nothing is written into the working directory. The only
+    // cost is bulk_extractor's own report.xml recording <image_filename> as
+    // the relative path, so we log the absolute one next to the command.
+    std::wstring workDir, relInput;
+    if (!wsl) {
+        if (isDir) {
+            workDir  = inputPath;
+            relInput = L".";
+        } else {
+            const size_t slash = inputPath.find_last_of(L"\\/");
+            if (slash != std::wstring::npos && slash + 1 < inputPath.size()) {
+                workDir  = inputPath.substr(0, slash);
+                relInput = inputPath.substr(slash + 1);
+            }
+        }
+        if (!workDir.empty() && !DirExists(workDir)) { workDir.clear(); relInput.clear(); }
+    }
+    const bool useRelInput = !relInput.empty();
+
     const std::wstring outArg = wsl ? pathArg(s.outputDir)
                               : shortPaths ? ShortPathForCmdline(s.outputDir) : s.outputDir;
     cmd += L" -o ";
@@ -3800,15 +3835,20 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
         Log(L"extra arguments: " + s.extraArgs);
     }
 
-    const std::wstring inArg = wsl ? pathArg(inputPath)
-                             : shortPaths ? ShortPathForCmdline(inputPath) : inputPath;
+    const std::wstring inArg = wsl        ? pathArg(inputPath)
+                             : useRelInput ? relInput
+                             : shortPaths  ? ShortPathForCmdline(inputPath) : inputPath;
     cmd += L" ";
     cmd += QuoteIfNeeded(inArg);
 
     Log(L"command: " + cmd);
-    if (shortPaths && (outArg != s.outputDir || inArg != inputPath)) {
-        Log(L"(directory scan: paths passed to bulk_extractor in 8.3 short form — its carved-file "
-            L"names embed the full input path on Windows and would exceed MAX_PATH otherwise)");
+    if (useRelInput) {
+        Log(L"(working directory: " + workDir + L" \u2014 bulk_extractor is given a relative input "
+            L"path so its carved-file names, which embed the input path verbatim, stay well under "
+            L"MAX_PATH)");
+    } else if (shortPaths && outArg != s.outputDir) {
+        Log(L"(directory scan: output path passed to bulk_extractor in 8.3 short form \u2014 its "
+            L"carved-file names embed the input path on Windows and would exceed MAX_PATH otherwise)");
     } else if (shortPaths) {
         Log(L"(note: 8.3 short names unavailable on this volume \u2014 long carved-file names "
             L"from a directory scan may exceed MAX_PATH; see README \"Known issues\")");
@@ -3821,7 +3861,10 @@ static bool RunBulkExtractor(const Settings& s, const std::wstring& inputPath,
     PROCESS_INFORMATION pi = {};
 
     BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
-                             CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi);
+                             CREATE_NEW_CONSOLE,
+                             nullptr,
+                             workDir.empty() ? nullptr : workDir.c_str(),
+                             &si, &pi);
     if (!ok) {
         wchar_t buf[160];
         swprintf_s(buf, L"CreateProcessW failed: GetLastError=%lu",
@@ -4149,20 +4192,23 @@ typedef bool (*ExportProgressFn)(size_t done, size_t total, UINT64 bytes);
 static size_t ExportNameBudget(const std::wstring& outputDir, const std::wstring& tempDir,
                                bool wsl, std::wstring& outNote) {
     if (wsl) return 4096;
+    (void)tempDir;   // the input reaches BE as "." (see RunBulkExtractor)
     // The output dir may not exist yet — create it so its short form is known
     // (BE requires the dir to exist or be creatable anyway; empty is fine).
     if (!outputDir.empty() && !DirExists(outputDir)) SHCreateDirectoryExW(nullptr, outputDir.c_str(), nullptr);
     const std::wstring outShort = ShortPathForCmdline(outputDir);
-    const std::wstring inShort  = ShortPathForCmdline(tempDir);
+    // The input path BE embeds is the RELATIVE one we pass it, not the temp
+    // dir's own length.
+    const int kRelInput  = 1;             // "."
     const int kMaxPath   = 259;
     const int kSubdir    = (int)wcslen(L"\\evtx_carved\\000\\");
     const int kSuffix    = 40;            // "_valid_header_NNchunks_NNactual.evtx"
-    const int perCopy    = (int)inShort.size() + 1 /*_*/ + 6 /*____-0*/;
+    const int perCopy    = kRelInput + 1 /*_*/ + 6 /*____-0*/;
     const int budget     = kMaxPath - (int)outShort.size() - kSubdir - kSuffix - 2 * perCopy;
     const int nameCap    = budget / 2;    // the name appears in both copies
     wchar_t note[400];
-    swprintf_s(note, L"carved-path budget: output %zu + input %zu chars (8.3 forms) \u2192 exported file names capped at %d chars",
-               outShort.size(), inShort.size(), nameCap < 0 ? 0 : nameCap);
+    swprintf_s(note, L"carved-path budget: output %zu chars + relative input \u2192 exported file names capped at %d chars",
+               outShort.size(), nameCap < 0 ? 0 : nameCap);
     outNote = note;
     return nameCap < 0 ? 0 : (size_t)nameCap;
 }

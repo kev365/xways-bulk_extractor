@@ -97,7 +97,10 @@ from that thread. `RebuildScannerGrid` is the only thing allowed to replace
   while `g_exportActive` is set.
 - bulk_extractor exit 6 ("Disk write error ... probably full") on a
   directory scan is the upstream MAX_PATH carved-filename bug — native mode
-  passes 8.3 short paths on the BE command line to dodge it (README "Known
+  runs BE with its working directory set to the input and passes a relative
+  input path (`.`), which collapses the path prefix BE embeds in every carved
+  name; the 8.3 short output path and the export name cap remain as backstops
+  (README "Known
   issues").
 - `XT_Finalize` returns `0x02` ("save volume snapshot") when the run added
   labels or an evidence object.
